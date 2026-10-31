@@ -1,0 +1,14 @@
+{
+  "name": "@cfordo/example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --filter cfordo build && wrangler dev",
+    "types": "wrangler types",
+    "typecheck": "wrangler types --check && tsrs --noEmit",
+    "deploy": "pnpm --filter cfordo build && wrangler deploy"
+  },
+  "dependencies": {
+    "cfordo": "workspace:*"
+  }
+}

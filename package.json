@@ -1,0 +1,48 @@
+{
+  "name": "cfordo",
+  "version": "0.1.0",
+  "description": "Playbook-driven workflows for Cloudflare Workflows, Queues and D1.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.ja.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "sideEffects": false,
+  "packageManager": "pnpm@12.16.1",
+  "engines": {
+    "node": ">=24"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
+    "build": "pnpm clean && tsrs --emitDeclarationOnly && esbuild src/index.ts --bundle --format=esm --platform=neutral --target=es2022 --packages=external --loader:.sql=text --sourcemap --outfile=dist/index.js",
+    "typecheck": "tsrs --noEmit",
+    "test": "pnpm build && tsrs --noEmit -p test/tsconfig.json && tsrs --noEmit -p test/types/tsconfig.json && pnpm test:core && node --test test/workers.test.mjs",
+    "check": "pnpm typecheck && pnpm test",
+    "prepack": "pnpm build",
+    "prepublishOnly": "pnpm check",
+    "deploy": "pnpm publish --access public",
+    "test:core": "esbuild test/entry.ts --bundle --format=esm --platform=node --packages=external --loader:.sql=text --outfile=test/.build/core.mjs && node --test test/ordo.test.mjs test/context.test.mjs test/core/*.test.mjs test/db/*.test.mjs"
+  },
+  "dependencies": {
+    "cfqu": "^0.1.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261030.1",
+    "esbuild": "0.28.2",
+    "hono": "4.13.14",
+    "miniflare": "5.20261023.3-beta",
+    "tsrs": "0.20.1-ts7.1.0-beta",
+    "wrangler": "4.156.0"
+  }
+}
