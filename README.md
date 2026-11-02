@@ -93,11 +93,11 @@ Use `setup()` to register bindings, settings, and steps. New instances invoke it
 
 `this.binding()` is required. Supply all three bindings together, once:
 
-| Key | Required | Purpose |
-|---|---|---|
-| `db` | Yes | D1 binding for execution state and results |
-| `queue` | Yes | Queue binding for sending step execution requests |
-| `workflow` | Yes | Workflow binding for completion notifications after results are saved |
+| Key        | Required | Purpose                                                               |
+| ---------- | -------- | --------------------------------------------------------------------- |
+| `db`       | Yes      | D1 binding for execution state and results                            |
+| `queue`    | Yes      | Queue binding for sending step execution requests                     |
+| `workflow` | Yes      | Workflow binding for completion notifications after results are saved |
 
 The type system checks that all three bindings are provided. A missing `binding()` call or invalid bindings also cause an error before business logic starts.
 Specify the Queue and notification destination for the Ordo instance once; individual steps do not repeat the bindings.
@@ -105,9 +105,9 @@ If one consumer serves multiple Ordo classes, your application selects the appro
 
 `this.configure()` is optional and accepts the following execution setting:
 
-| Key | Required | Purpose |
-|---|---|---|
-| `expiresIn` | No | Goal lifetime in milliseconds, as a positive integer. Defaults to 24 hours. |
+| Key         | Required | Purpose                                                                     |
+| ----------- | -------- | --------------------------------------------------------------------------- |
+| `expiresIn` | No       | Goal lifetime in milliseconds, as a positive integer. Defaults to 24 hours. |
 
 A Goal represents one workflow run.
 Registration does not access the database or send Queue messages. Processing starts only after `setup()` succeeds and the settings and steps have been checked.
@@ -117,12 +117,12 @@ Settings and steps cannot be changed after execution starts.
 
 `this.step()` accepts one object. Its return value is not used.
 
-| Key | Required | Purpose |
-|---|---|---|
-| `name` | Yes | Step name |
-| `run` | Yes | Asynchronous method or function that performs business logic and returns a result |
-| `validate` | No | Asynchronous method or function that checks business rules |
-| `evaluate` | No | Asynchronous method or function that evaluates whether the result is acceptable |
+| Key        | Required | Purpose                                                                           |
+| ---------- | -------- | --------------------------------------------------------------------------------- |
+| `name`     | Yes      | Step name                                                                         |
+| `run`      | Yes      | Asynchronous method or function that performs business logic and returns a result |
+| `validate` | No       | Asynchronous method or function that checks business rules                        |
+| `evaluate` | No       | Asynchronous method or function that evaluates whether the result is acceptable   |
 
 Registered methods execute with `this` bound to their Ordo instance. You do not need to call `.bind(this)` yourself.
 Business logic, validation, and evaluation can use `this.env` and shared methods on the class.
@@ -153,16 +153,16 @@ Await asynchronous registration in `setup()`. Business logic does not start if t
 
 Business logic, validation, and evaluation each receive one `OrdoContext`.
 
-| API or value | Description |
-|---|---|
-| `ctx.params<T>()` | Parameters supplied when the Goal starts. Defaults to `any` when no type argument is provided. |
+| API or value      | Description                                                                                                                                       |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ctx.params<T>()` | Parameters supplied when the Goal starts. Defaults to `any` when no type argument is provided.                                                    |
 | `ctx.result<T>()` | Business result being validated or evaluated. Defaults to `any` when no type argument is provided. Returns `undefined` during business execution. |
-| `ctx.goalId` | Goal ID |
-| `ctx.stepName` | Name of the executing step |
-| `ctx.attemptId` | ID identifying one attempt to execute a step |
-| `ctx.feedback` | Reason for a previous failed check: `{ source: "validate" or "evaluate", reason: string }`. Absent on the first execution. |
-| `ctx.ok()` | A successful validation or evaluation. Takes no arguments. |
-| `ctx.ng(reason)` | A failed validation or evaluation. Requires a reason containing at least one non-whitespace character. |
+| `ctx.goalId`      | Goal ID                                                                                                                                           |
+| `ctx.stepName`    | Name of the executing step                                                                                                                        |
+| `ctx.attemptId`   | ID identifying one attempt to execute a step                                                                                                      |
+| `ctx.feedback`    | Reason for a previous failed check: `{ source: "validate" or "evaluate", reason: string }`. Absent on the first execution.                        |
+| `ctx.ok()`        | A successful validation or evaluation. Takes no arguments.                                                                                        |
+| `ctx.ng(reason)`  | A failed validation or evaluation. Requires a reason containing at least one non-whitespace character.                                            |
 
 Type arguments to `params()` and `result()` provide static types only. They do not validate or transform values at runtime.
 Changing retrieved data does not modify the saved input or result.
@@ -210,11 +210,13 @@ Generate application binding and runtime types with `wrangler types`.
 ```sh
 mise install
 pnpm install --frozen-lockfile
+pnpm format
 pnpm check
 pnpm build
 pnpm --filter @cfordo/example typecheck
 ```
 
+`pnpm format` runs Prettier through `npx` with its default formatting settings, without adding a configuration file or project dependency. It respects `.gitignore` and excludes `example/worker-configuration.d.ts` and `pnpm-lock.yaml`.
 `pnpm test` checks the public API types, configuration, registration, verdicts, execution control, and database behavior. It also runs integration tests for Workflows, Queues, D1, and Hono in the Workers runtime.
 Tests do not deploy to Cloudflare or call external AI APIs.
 `pnpm build` writes ESM JavaScript, type declarations, and source maps to `dist`.

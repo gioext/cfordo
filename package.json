@@ -24,6 +24,7 @@
     "access": "public"
   },
   "scripts": {
+    "format": "npx --yes prettier --write . --no-config --no-editorconfig '!example/worker-configuration.d.ts' '!pnpm-lock.yaml'",
     "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
     "build": "pnpm clean && tsrs --emitDeclarationOnly && esbuild src/index.ts --bundle --format=esm --platform=neutral --target=es2022 --packages=external --loader:.sql=text --sourcemap --outfile=dist/index.js",
     "typecheck": "tsrs --noEmit",

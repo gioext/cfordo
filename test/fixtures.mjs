@@ -16,17 +16,28 @@ export class TestDatabase {
         const prepared = db.sqlite.prepare(sql);
         let value;
         if (kind === "first") value = prepared.get(...values) ?? null;
-        else if (kind === "all") value = { success: true, results: prepared.all(...values), meta: {} };
+        else if (kind === "all")
+          value = { success: true, results: prepared.all(...values), meta: {} };
         else {
           const result = prepared.run(...values);
-          value = { success: true, results: [], meta: { changes: Number(result.changes), last_row_id: Number(result.lastInsertRowid) } };
+          value = {
+            success: true,
+            results: [],
+            meta: {
+              changes: Number(result.changes),
+              last_row_id: Number(result.lastInsertRowid),
+            },
+          };
         }
         db.after?.(sql, values, kind);
         return value;
       };
       return {
         bind: (...bound) => statement(bound),
-        first: async (column) => { const row = execute("first"); return column === undefined || row === null ? row : row[column]; },
+        first: async (column) => {
+          const row = execute("first");
+          return column === undefined || row === null ? row : row[column];
+        },
         all: async () => execute("all"),
         run: async () => execute("run"),
         execute,
@@ -46,9 +57,14 @@ export class TestDatabase {
     }
   }
   rows(table, where = "1", ...values) {
-    return this.sqlite.prepare(`SELECT * FROM ${table} WHERE ${where} ORDER BY id`).all(...values).map((row) => ({ ...row }));
+    return this.sqlite
+      .prepare(`SELECT * FROM ${table} WHERE ${where} ORDER BY id`)
+      .all(...values)
+      .map((row) => ({ ...row }));
   }
-  close() { this.sqlite.close(); }
+  close() {
+    this.sqlite.close();
+  }
 }
 
 export class EventHub {
@@ -59,30 +75,45 @@ export class EventHub {
   failBefore = 0;
   failAfter = 0;
   async send(event) {
-    if (this.failBefore-- > 0) throw new Error("Notification transport unavailable");
+    if (this.failBefore-- > 0)
+      throw new Error("Notification transport unavailable");
     for (let count = 0; count < (this.duplicate ? 2 : 1); count++) {
       this.events.push(structuredClone(event));
       const listener = this.listeners.get(event.type)?.shift();
       if (listener) listener({ payload: structuredClone(event.payload) });
-      else this.buffers.set(event.type, [...(this.buffers.get(event.type) ?? []), structuredClone(event.payload)]);
+      else
+        this.buffers.set(event.type, [
+          ...(this.buffers.get(event.type) ?? []),
+          structuredClone(event.payload),
+        ]);
     }
     if (this.failAfter-- > 0) throw new Error("Notification response lost");
   }
   wait(type) {
     const buffer = this.buffers.get(type);
     if (buffer?.length) return Promise.resolve({ payload: buffer.shift() });
-    return new Promise((resolve) => this.listeners.set(type, [...(this.listeners.get(type) ?? []), resolve]));
+    return new Promise((resolve) =>
+      this.listeners.set(type, [...(this.listeners.get(type) ?? []), resolve]),
+    );
   }
 }
 
 export class TestWorkflowStep {
-  constructor(hub) { this.hub = hub; }
+  constructor(hub) {
+    this.hub = hub;
+  }
   calls = [];
   cache = new Map();
   beforeWait = undefined;
   async do(name, config, callback) {
     this.calls.push({ name, config });
-    if (!this.cache.has(name)) this.cache.set(name, Promise.resolve().then(callback).then((value) => structuredClone(value)));
+    if (!this.cache.has(name))
+      this.cache.set(
+        name,
+        Promise.resolve()
+          .then(callback)
+          .then((value) => structuredClone(value)),
+      );
     return structuredClone(await this.cache.get(name));
   }
   async waitForEvent(name, options) {
@@ -97,15 +128,32 @@ export class TestWorkflowStep {
 
 export function queueMessage(body, attempts = 1) {
   return {
-    id: `message-${body.attemptId ?? "invalid"}`, body: structuredClone(body), attempts, timestamp: new Date(),
-    acknowledged: false, retried: false,
-    ack() { if (!this.retried) this.acknowledged = true; },
-    retry() { if (!this.acknowledged) this.retried = true; },
+    id: `message-${body.attemptId ?? "invalid"}`,
+    body: structuredClone(body),
+    attempts,
+    timestamp: new Date(),
+    acknowledged: false,
+    retried: false,
+    ack() {
+      if (!this.retried) this.acknowledged = true;
+    },
+    retry() {
+      if (!this.acknowledged) this.retried = true;
+    },
   };
 }
 
 export function queueBatch(messages, name = "jobs") {
-  return { queue: name, messages, ackAll() { messages.forEach((message) => message.ack()); }, retryAll() { messages.forEach((message) => message.retry()); } };
+  return {
+    queue: name,
+    messages,
+    ackAll() {
+      messages.forEach((message) => message.ack());
+    },
+    retryAll() {
+      messages.forEach((message) => message.retry());
+    },
+  };
 }
 
 export async function harness(t, options = {}) {
@@ -117,10 +165,22 @@ export async function harness(t, options = {}) {
   const delivered = [];
   const pending = new Set();
   const destinations = [];
-  const workflowBinding = { get: async (id) => { destinations.push(id); return { sendEvent: (event) => hub.send(event) }; } };
-  const context = { waitUntil(promise) { pending.add(promise); void promise.finally(() => pending.delete(promise)); } };
+  const workflowBinding = {
+    get: async (id) => {
+      destinations.push(id);
+      return { sendEvent: (event) => hub.send(event) };
+    },
+  };
+  const context = {
+    waitUntil(promise) {
+      pending.add(promise);
+      void promise.finally(() => pending.delete(promise));
+    },
+  };
   const runtime = {
-    db, step, event: { instanceId: "workflow-1" },
+    db,
+    step,
+    event: { instanceId: "workflow-1" },
     expiresIn: options.expiresIn,
     queue: {
       async send(body) {
@@ -134,39 +194,93 @@ export async function harness(t, options = {}) {
     onSend: undefined,
     dropDelivery: false,
   };
-  const configuration = { bindings: { db: db, queue: runtime.queue, workflow: workflowBinding }, expiresIn: options.expiresIn };
+  const configuration = {
+    bindings: { db: db, queue: runtime.queue, workflow: workflowBinding },
+    expiresIn: options.expiresIn,
+  };
   const consumer = new Ordo();
   consumer.binding(configuration.bindings);
   consumer.configure({ expiresIn: configuration.expiresIn });
   function schedule(body, number) {
     const message = queueMessage(body, number);
     delivered.push(message);
-    const work = Promise.resolve().then(() => consumer.queue(queueBatch([message]), {}, context)).then(() => {
-      if (message.retried && number < 4) schedule(body, number + 1);
-    });
+    const work = Promise.resolve()
+      .then(() => consumer.queue(queueBatch([message]), {}, context))
+      .then(() => {
+        if (message.retried && number < 4) schedule(body, number + 1);
+      });
     pending.add(work);
     void work.finally(() => pending.delete(work));
   }
-  async function drain() { while (pending.size) await Promise.all([...pending]); }
-  t.after(async () => { await drain(); db.close(); });
+  async function drain() {
+    while (pending.size) await Promise.all([...pending]);
+  }
+  t.after(async () => {
+    await drain();
+    db.close();
+  });
   return {
-    db, hub, step, consumer, runtime, sent, delivered, drain, destinations,
-    workflow: consumer, configuration,
-    newDefinition() { const definition = new Ordo(); definition.binding(configuration.bindings); definition.configure({ expiresIn: configuration.expiresIn }); return definition; },
-    run(input) { return consumer.run({ ...runtime.event, payload: input }, step); },
-    replay(definition, input) { return definition.run({ ...runtime.event, payload: input }, step); },
+    db,
+    hub,
+    step,
+    consumer,
+    runtime,
+    sent,
+    delivered,
+    drain,
+    destinations,
+    workflow: consumer,
+    configuration,
+    newDefinition() {
+      const definition = new Ordo();
+      definition.binding(configuration.bindings);
+      definition.configure({ expiresIn: configuration.expiresIn });
+      return definition;
+    },
+    run(input) {
+      return consumer.run({ ...runtime.event, payload: input }, step);
+    },
+    replay(definition, input) {
+      return definition.run({ ...runtime.event, payload: input }, step);
+    },
     intent(attemptId, extra = {}) {
       const row = db.rows("cfordo_attempts", "id = ?", attemptId)[0];
-      return { protocol: "cfordo/1", goalId: row.goal_id, stepName: row.step_name, attemptId, instanceId: "workflow-1", ...extra };
+      return {
+        protocol: "cfordo/1",
+        goalId: row.goal_id,
+        stepName: row.step_name,
+        attemptId,
+        instanceId: "workflow-1",
+        ...extra,
+      };
     },
   };
 }
 
 export function seedAttempt(db, options = {}) {
   const now = Date.now();
-  const goalId = Number(db.sqlite.prepare("INSERT INTO cfordo_goals (input_json,status,created_at,expires_at) VALUES (?, 'running', ?, ?)")
-    .run(JSON.stringify(options.input ?? {}), now, options.expiresAt ?? now + 86400000).lastInsertRowid);
-  const attemptId = Number(db.sqlite.prepare("INSERT INTO cfordo_attempts (goal_id,step_name,worker_name,created_at) VALUES (?, ?, ?, ?)")
-    .run(goalId, options.stepName ?? "extract", options.workerName ?? "extract", now).lastInsertRowid);
+  const goalId = Number(
+    db.sqlite
+      .prepare(
+        "INSERT INTO cfordo_goals (input_json,status,created_at,expires_at) VALUES (?, 'running', ?, ?)",
+      )
+      .run(
+        JSON.stringify(options.input ?? {}),
+        now,
+        options.expiresAt ?? now + 86400000,
+      ).lastInsertRowid,
+  );
+  const attemptId = Number(
+    db.sqlite
+      .prepare(
+        "INSERT INTO cfordo_attempts (goal_id,step_name,worker_name,created_at) VALUES (?, ?, ?, ?)",
+      )
+      .run(
+        goalId,
+        options.stepName ?? "extract",
+        options.workerName ?? "extract",
+        now,
+      ).lastInsertRowid,
+  );
   return { goalId, attemptId };
 }

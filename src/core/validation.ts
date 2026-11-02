@@ -1,4 +1,12 @@
-import type { AttemptError, CheckDecision, CheckFunction, CheckResult, ErrorSource, JsonValue, OrdoContext } from "../types.ts";
+import type {
+  AttemptError,
+  CheckDecision,
+  CheckFunction,
+  CheckResult,
+  ErrorSource,
+  JsonValue,
+  OrdoContext,
+} from "../types.ts";
 
 // Identity-based decisions prevent arbitrary return objects from being accepted.
 // The marker also makes returning a decision as business JSON an explicit error.
@@ -18,14 +26,23 @@ export function createContext(
   }
   const ctx: OrdoContext = Object.freeze({
     ...details,
-    params<T = any>(): T { return structuredClone(params) as T; },
-    result<T = any>(): T { return structuredClone(result) as T; },
+    params<T = any>(): T {
+      return structuredClone(params) as T;
+    },
+    result<T = any>(): T {
+      return structuredClone(result) as T;
+    },
     ok(): CheckDecision {
-      if (arguments.length !== 0) throw new TypeError("ok() does not accept arguments");
+      if (arguments.length !== 0)
+        throw new TypeError("ok() does not accept arguments");
       return decision({ ok: true });
     },
     ng(reason: string): CheckDecision {
-      if (arguments.length !== 1 || typeof reason !== "string" || !reason.trim()) {
+      if (
+        arguments.length !== 1 ||
+        typeof reason !== "string" ||
+        !reason.trim()
+      ) {
         throw new TypeError("ng() requires one non-empty reason");
       }
       return decision({ ok: false, reason });
@@ -35,17 +52,28 @@ export function createContext(
   return ctx;
 }
 
-export function assertJson(value: unknown, label = "Value"): asserts value is JsonValue {
+export function assertJson(
+  value: unknown,
+  label = "Value",
+): asserts value is JsonValue {
   const ancestors = new Set<object>();
   function visit(item: unknown): void {
-    if (item === null || typeof item === "string" || typeof item === "boolean") return;
+    if (item === null || typeof item === "string" || typeof item === "boolean")
+      return;
     if (typeof item === "number" && Number.isFinite(item)) return;
-    if (typeof item !== "object" || item === null) throw new TypeError(`${label} must be a JSON value`);
-    if (ancestors.has(item)) throw new TypeError(`${label} must not contain cycles`);
-    if (!Array.isArray(item) && Object.getPrototypeOf(item) !== Object.prototype && Object.getPrototypeOf(item) !== null) {
+    if (typeof item !== "object" || item === null)
+      throw new TypeError(`${label} must be a JSON value`);
+    if (ancestors.has(item))
+      throw new TypeError(`${label} must not contain cycles`);
+    if (
+      !Array.isArray(item) &&
+      Object.getPrototypeOf(item) !== Object.prototype &&
+      Object.getPrototypeOf(item) !== null
+    ) {
       throw new TypeError(`${label} must contain only plain JSON objects`);
     }
-    if (Object.getOwnPropertySymbols(item).length) throw new TypeError(`${label} must not contain symbol keys`);
+    if (Object.getOwnPropertySymbols(item).length)
+      throw new TypeError(`${label} must not contain symbol keys`);
     ancestors.add(item);
     if (Array.isArray(item)) {
       for (let index = 0; index < item.length; index++) visit(item[index]);
@@ -57,14 +85,25 @@ export function assertJson(value: unknown, label = "Value"): asserts value is Js
   visit(value);
 }
 
-export async function runCheck(fn: CheckFunction, ctx: OrdoContext): Promise<CheckResult> {
+export async function runCheck(
+  fn: CheckFunction,
+  ctx: OrdoContext,
+): Promise<CheckResult> {
   const decision = await fn(ctx);
-  const result = decision && typeof decision === "object" ? contexts.get(ctx)?.get(decision) : undefined;
-  if (!result) throw new TypeError("A check must return its context's ok() or ng(reason)");
+  const result =
+    decision && typeof decision === "object"
+      ? contexts.get(ctx)?.get(decision)
+      : undefined;
+  if (!result)
+    throw new TypeError("A check must return its context's ok() or ng(reason)");
   return result;
 }
 
-export function recordError(error: unknown, source: ErrorSource, extra: Pick<AttemptError, "fatal"> = {}): AttemptError {
+export function recordError(
+  error: unknown,
+  source: ErrorSource,
+  extra: Pick<AttemptError, "fatal"> = {},
+): AttemptError {
   return {
     source,
     name: error instanceof Error ? error.name : "Error",

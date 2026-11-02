@@ -10,14 +10,18 @@
       "binding": "DB",
       "database_name": "example-ordo-db",
       "database_id": "b9147f5d-5b9b-4dc5-b5bc-5e51a6bb4643",
-      "remote": true
-    }
+      "remote": true,
+    },
   ],
   "queues": {
     "producers": [{ "binding": "QUEUE", "queue": "example-ordo-queue" }],
-    "consumers": [{ "queue": "example-ordo-queue", "max_batch_timeout": 0 }]
+    "consumers": [{ "queue": "example-ordo-queue", "max_batch_timeout": 0 }],
   },
   "workflows": [
-    { "binding": "WORKFLOW", "name": "example-ordo-workflow", "class_name": "ExampleWorkflow" }
-  ]
+    {
+      "binding": "WORKFLOW",
+      "name": "example-ordo-workflow",
+      "class_name": "ExampleWorkflow",
+    },
+  ],
 }

@@ -38,17 +38,20 @@ export class ExampleWorkflow extends Ordo<Env> {
   }
 
   async validate(ctx: OrdoContext) {
-    if (!Number.isFinite(ctx.result().value)) return ctx.ng("結果が有限の数値ではありません");
+    if (!Number.isFinite(ctx.result().value))
+      return ctx.ng("結果が有限の数値ではありません");
     return ctx.ok();
   }
 
   async evaluateDouble(ctx: OrdoContext) {
-    if (ctx.result().value !== ctx.params().value * 2) return ctx.ng("入力を2倍した結果と一致しません");
+    if (ctx.result().value !== ctx.params().value * 2)
+      return ctx.ng("入力を2倍した結果と一致しません");
     return ctx.ok();
   }
 
   async evaluateSquare(ctx: OrdoContext) {
-    if (ctx.result().value !== ctx.params().value ** 2) return ctx.ng("入力を2乗した結果と一致しません");
+    if (ctx.result().value !== ctx.params().value ** 2)
+      return ctx.ng("入力を2乗した結果と一致しません");
     return ctx.ok();
   }
 }

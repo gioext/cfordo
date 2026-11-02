@@ -14,12 +14,12 @@ Ordoを継承したクラスから、2つの工程をQueue経由で並列実行�
 - `setup()`内で接続・設定・工程を登録し、同じクラスをWorkflowとQueue Consumerとして公開する。
 - `ctx.params()`・`ctx.result()`でデータを取得し、検証・評価は`ctx.ok()`・`ctx.ng(reason)`を返す。
 
-| リソース | 名前 |
-|---|---|
-| Worker | `example-ordo` |
-| D1 | `example-ordo-db` |
+| リソース | 名前                    |
+| -------- | ----------------------- |
+| Worker   | `example-ordo`          |
+| D1       | `example-ordo-db`       |
 | Workflow | `example-ordo-workflow` |
-| Queue | `example-ordo-queue` |
+| Queue    | `example-ordo-queue`    |
 
 ## 開発環境
 

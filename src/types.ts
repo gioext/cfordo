@@ -1,8 +1,10 @@
-export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+export type JsonValue =
+  null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type GoalStatus = "ready" | "running" | "completed" | "failed";
 export type RunStatus = "completed" | "failed" | "expired";
 export type EffectiveGoalStatus = GoalStatus | "expired";
-export type AttemptStatus = "ready" | "running" | "validating" | "evaluating" | "completed" | "failed";
+export type AttemptStatus =
+  "ready" | "running" | "validating" | "evaluating" | "completed" | "failed";
 export type CheckSource = "validate" | "evaluate";
 
 export interface OrdoContext {
@@ -20,7 +22,9 @@ export interface OrdoContext {
 
 declare const decisionBrand: unique symbol;
 /** Only context.ok()/ng() can create a check decision. */
-export interface CheckDecision { readonly [decisionBrand]: true }
+export interface CheckDecision {
+  readonly [decisionBrand]: true;
+}
 export type CheckFunction = (ctx: OrdoContext) => Promise<CheckDecision>;
 
 export interface StepDefinition {
@@ -47,7 +51,9 @@ export interface DatabaseStatement {
 
 export interface DatabaseBinding {
   prepare(sql: string): DatabaseStatement;
-  batch<Row = unknown>(statements: DatabaseStatement[]): Promise<DatabaseResult<Row>[]>;
+  batch<Row = unknown>(
+    statements: DatabaseStatement[],
+  ): Promise<DatabaseResult<Row>[]>;
 }
 
 export interface QueueBinding {
@@ -60,7 +66,10 @@ export interface WorkflowStepBinding {
     config: { retries: { limit: number; delay: number } },
     callback: () => Promise<Value>,
   ): Promise<Value>;
-  waitForEvent(name: string, options: { type: string }): Promise<{ payload: unknown }>;
+  waitForEvent(
+    name: string,
+    options: { type: string },
+  ): Promise<{ payload: unknown }>;
 }
 
 export interface WorkflowBinding {
@@ -89,7 +98,11 @@ export interface QueueContext {
   waitUntil(promise: Promise<unknown>): void;
 }
 
-export type QueueHandler<Env = unknown> = (batch: QueueBatch, env: Env, ctx: QueueContext) => Promise<void>;
+export type QueueHandler<Env = unknown> = (
+  batch: QueueBatch,
+  env: Env,
+  ctx: QueueContext,
+) => Promise<void>;
 
 export interface OrdoBindings {
   db: DatabaseBinding;
@@ -166,7 +179,10 @@ export interface Runtime {
 }
 
 export type AttemptOutcome = "completed" | "retry" | "failed" | "expired";
-export type WorkerExecutor = (intent: Intent, bindings: OrdoBindings) => Promise<void>;
+export type WorkerExecutor = (
+  intent: Intent,
+  bindings: OrdoBindings,
+) => Promise<void>;
 
 // Application failures are recorded and counted by cfordo, not multiplied by
 // WorkflowStep's default retry policy. No delay is used with a zero retry limit.

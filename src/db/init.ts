@@ -44,24 +44,37 @@ function statements(sql: string): string[] {
 }
 
 async function appliedVersions(db: DatabaseBinding): Promise<number[]> {
-  const table = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cfordo_schema_versions'").first();
+  const table = await db
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cfordo_schema_versions'",
+    )
+    .first();
   if (!table) return [];
-  const result = await db.prepare("SELECT id FROM cfordo_schema_versions ORDER BY id").all<{ id: number }>();
-  if (!result.success) throw new Error(result.error || "Cannot read migration versions");
+  const result = await db
+    .prepare("SELECT id FROM cfordo_schema_versions ORDER BY id")
+    .all<{ id: number }>();
+  if (!result.success)
+    throw new Error(result.error || "Cannot read migration versions");
   return (result.results ?? []).map((row) => row.id);
 }
 
 export async function initOrdo(db: DatabaseBinding): Promise<void> {
   const applied = await appliedVersions(db);
   if (applied.some((id, index) => migrations[index]?.id !== id)) {
-    throw new Error("The database has a migration version unsupported by this cfordo package");
+    throw new Error(
+      "The database has a migration version unsupported by this cfordo package",
+    );
   }
   for (const migration of migrations) {
     if (applied.includes(migration.id)) continue;
     try {
       const results = await db.batch([
         ...statements(migration.sql).map((sql) => db.prepare(sql)),
-        db.prepare("INSERT INTO cfordo_schema_versions (id, applied_at) VALUES (?, ?)").bind(migration.id, Date.now()),
+        db
+          .prepare(
+            "INSERT INTO cfordo_schema_versions (id, applied_at) VALUES (?, ?)",
+          )
+          .bind(migration.id, Date.now()),
       ]);
       const failure = results.find((result) => !result.success);
       if (failure) throw new Error(failure.error || "Migration failed");

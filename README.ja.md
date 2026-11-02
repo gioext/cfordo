@@ -91,10 +91,10 @@ Workflow側とQueue側は同じクラスの定義を使用するが、インス�
 
 `this.binding()`は必須で、3つの接続をまとめて一度だけ指定する。
 
-| キー | 必須 | 内容 |
-|---|---|---|
-| `db` | 必須 | 状態と結果を保存するD1 Binding |
-| `queue` | 必須 | 工程の実行要求を送信するQueue Binding |
+| キー       | 必須 | 内容                                       |
+| ---------- | ---- | ------------------------------------------ |
+| `db`       | 必須 | 状態と結果を保存するD1 Binding             |
+| `queue`    | 必須 | 工程の実行要求を送信するQueue Binding      |
 | `workflow` | 必須 | 結果保存後に完了通知を送るWorkflow Binding |
 
 3つの指定不足は型で検出する。`binding()`自体の呼び忘れや不正な接続設定も、業務処理開始前にエラーとする。
@@ -103,8 +103,8 @@ Workflow側とQueue側は同じクラスの定義を使用するが、インス�
 
 `this.configure()`は任意。次の実行設定を受け取る。
 
-| キー | 必須 | 内容 |
-|---|---|---|
+| キー        | 必須 | 内容                                             |
+| ----------- | ---- | ------------------------------------------------ |
 | `expiresIn` | 任意 | Goalの有効期間。正の整数のミリ秒。省略時は24時間 |
 
 登録時にはDB操作やQueue送信を行わない。`setup()`が正常終了して設定と工程の確認が完了してから開始する。
@@ -114,12 +114,12 @@ Workflow側とQueue側は同じクラスの定義を使用するが、インス�
 
 `this.step()`は1つのオブジェクトを受け取り、戻り値は使用しない。
 
-| キー | 必須 | 内容 |
-|---|---|---|
-| `name` | 必須 | 工程名 |
-| `run` | 必須 | 業務処理を行い、結果を返す非同期メソッド・関数 |
-| `validate` | 任意 | 業務ルールを検証する非同期メソッド・関数 |
-| `evaluate` | 任意 | 結果の妥当性を評価する非同期メソッド・関数 |
+| キー       | 必須 | 内容                                           |
+| ---------- | ---- | ---------------------------------------------- |
+| `name`     | 必須 | 工程名                                         |
+| `run`      | 必須 | 業務処理を行い、結果を返す非同期メソッド・関数 |
+| `validate` | 任意 | 業務ルールを検証する非同期メソッド・関数       |
+| `evaluate` | 任意 | 結果の妥当性を評価する非同期メソッド・関数     |
 
 渡したメソッドは、そのOrdoインスタンスに結び付けて実行する。利用側で`.bind(this)`を書く必要はない。
 `this.env`やクラス内の共通メソッドを、業務処理・検証・評価から利用できる。
@@ -150,16 +150,16 @@ Step名の重複、空の並列工程、並列工程のネストは禁止する�
 
 業務処理・検証・評価は、全て`OrdoContext`を1つ受け取る。
 
-| API・値 | 内容 |
-|---|---|
-| `ctx.params<T>()` | Goalの起動パラメータ。型指定を省略すると`any` |
-| `ctx.result<T>()` | 検証・評価対象の業務結果。型指定を省略すると`any`。業務処理中は`undefined` |
-| `ctx.goalId` | GoalのID |
-| `ctx.stepName` | 実行している工程名 |
-| `ctx.attemptId` | 工程起動1回を識別するID |
-| `ctx.feedback` | 再実行時のNG理由。`{ source: "validate" または "evaluate", reason: string }`。初回は未設定 |
-| `ctx.ok()` | 検証・評価の成功。引数なし |
-| `ctx.ng(reason)` | 検証・評価のNG。空白だけではない理由が必須 |
+| API・値           | 内容                                                                                       |
+| ----------------- | ------------------------------------------------------------------------------------------ |
+| `ctx.params<T>()` | Goalの起動パラメータ。型指定を省略すると`any`                                              |
+| `ctx.result<T>()` | 検証・評価対象の業務結果。型指定を省略すると`any`。業務処理中は`undefined`                 |
+| `ctx.goalId`      | GoalのID                                                                                   |
+| `ctx.stepName`    | 実行している工程名                                                                         |
+| `ctx.attemptId`   | 工程起動1回を識別するID                                                                    |
+| `ctx.feedback`    | 再実行時のNG理由。`{ source: "validate" または "evaluate", reason: string }`。初回は未設定 |
+| `ctx.ok()`        | 検証・評価の成功。引数なし                                                                 |
+| `ctx.ng(reason)`  | 検証・評価のNG。空白だけではない理由が必須                                                 |
 
 `params()`・`result()`の型引数は静的な型指定であり、実行時の検証や変換は行わない。
 取得したデータを変更しても保存済みの入力・結果は変更されない。
@@ -207,11 +207,13 @@ Node.js・pnpmは`mise.toml`のバージョンを使用する。型チェック�
 ```sh
 mise install
 pnpm install --frozen-lockfile
+pnpm format
 pnpm check
 pnpm build
 pnpm --filter @cfordo/example typecheck
 ```
 
+`pnpm format`は、設定ファイルやプロジェクトの依存を追加せず、`npx`経由でPrettierをデフォルト設定で実行する。`.gitignore`に従い、`example/worker-configuration.d.ts`と`pnpm-lock.yaml`も除外する。
 `pnpm test`は、公開APIの型、設定・登録・判定・実行制御・DBのテスト、Workers環境でのWorkflow・Queue・D1・Honoの結合テストを実行する。
 Cloudflareへのデプロイや外部AI APIの呼び出しは行わない。
 `pnpm build`はESMのJavaScript・型定義・ソースマップを`dist`へ出力する。
