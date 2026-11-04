@@ -1,15 +1,15 @@
 {
   "name": "example-ordo",
-  "account_id": "36d2a7cb8e8c8b4d0a93e0cf69ed76f4",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-23",
-  "workers_dev": true,
+  "workers_dev": false,
   "preview_urls": false,
+  "routes": [],
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "example-ordo-db",
-      "database_id": "b9147f5d-5b9b-4dc5-b5bc-5e51a6bb4643",
+      "database_id": "00000000-0000-0000-0000-000000000000",
       "remote": true,
     },
   ],

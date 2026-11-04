@@ -4,7 +4,7 @@
 
 Cloudflare Workflows・Queues・D1で、事前に定義した工程を実行するTypeScriptフレームワーク。
 業務処理・検証・評価は独立したQueue処理として実行し、結果・判定・進行状態をD1で管理する。
-1 Workerにつき1つのOrdoクラスを定義し、専用のD1・Queue・Workflowを使用する。Honoを組み込んだHTTP APIで起動・一覧・結果取得を提供する。
+1 Workerにつき1つのOrdoクラスを定義し、専用のD1・Queue・Workflowを使用する。Honoを組み込んだ内部HTTP APIをサービスBinding経由で呼び出し、起動・一覧・結果取得を行う。公開URLは使用しない。
 
 実行中の工程変更、AIによる工程の追加・変更、Cloudflare以外へのデプロイは対象外とする。
 
@@ -44,7 +44,31 @@ export default MyWorkflow.worker();
 ```
 
 `Env`にはWranglerが生成するBinding型を使う。Workflowの名前付きexportをWranglerの`class_name`に指定する。上例では`MyWorkflow`。
-`MyWorkflow.worker()`がHTTPとQueueの入口を提供する。利用側でHonoや独自の起動ハンドラーを用意する必要はない。
+`MyWorkflow.worker()`がサービスBinding用のHTTPとQueueの入口を提供する。利用側でHonoや独自の起動ハンドラーを用意する必要はない。
+
+### サービスBinding
+
+Ordo側のWrangler設定は`workers_dev: false`、`preview_urls: false`、`routes: []`とし、公開ルート・カスタムドメインを設定しない。
+呼び出し元Workerは次のサービスBindingを持つ。`service`にはデプロイしたOrdo Workerの名前を指定する。
+
+```json
+{ "services": [{ "binding": "ORDO", "service": "example-ordo" }] }
+```
+
+呼び出し元の`Env`には`ORDO: Fetcher`を定義する。
+
+```ts
+const response = await env.ORDO.fetch("https://ordo/_ordo/goals", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ value: 7 }),
+});
+const { goalId } = await response.json<{ goalId: number }>();
+const detail = await env.ORDO.fetch(`https://ordo/_ordo/goals/${goalId}`);
+const list = await env.ORDO.fetch("https://ordo/_ordo/goals");
+```
+
+`https://ordo`はRequestを組み立てるためのURLで、公開ドメインやDNSの設定は不要。通信先はサービスBindingが決める。
 
 ### Goal API
 
@@ -195,7 +219,7 @@ Workflow基盤の正常終了と、業務上のGoalの成功は区別する。Go
 
 ## 開発環境
 
-Node.js・pnpmは`mise.toml`のバージョンを使用する。型チェックは`tsrs`、Cloudflare環境の検証はWranglerとMiniflareを使用する。
+Node.js・pnpmは`mise.toml`のバージョンを使用する。型チェックは`tsrs`を使用する。動作検証はWranglerでデプロイした本番のexampleで行う。
 利用側のBinding型・ランタイム型は`wrangler types`で生成する。
 
 ## 開発方法
@@ -205,18 +229,18 @@ mise install
 pnpm install --frozen-lockfile
 pnpm format
 pnpm check
-pnpm --filter @cfordo/example typecheck
 ```
 
 `pnpm format`は設定ファイルや依存を追加せず、`npx`経由でPrettierのデフォルト設定を使う。`.gitignore`に従い、生成型とロックファイルも除外する。
-`pnpm test`は型・保存・再試行・再開・並列実行のテストと、Workers環境でのWorkflow・Queue・D1・HTTP起動口の結合テストを実行する。
-テストはCloudflareへデプロイせず、外部AI APIも呼ばない。
+`pnpm check`はライブラリの型チェック・ビルドと、exampleの型チェックを行う。ローカルの確認だけで動作検証完了とはしない。
+動作検証は[exampleの手順](example/README.md)に従い、本番のexampleへサービスBinding経由で接続して行う。
 `pnpm build`はESMのJavaScript・型定義・ソースマップを`dist`へ生成する。
 
 ## デプロイ方法
 
-npm公開権限を持つアカウントで`pnpm run deploy`を実行する。公開前に型チェック・テスト・ビルドを実行する。
+npm公開権限を持つアカウントで`pnpm run deploy`を実行する。公開前に`pnpm check`と、本番のexampleでの動作検証を完了する。
 専用WorkerをWranglerでデプロイし、固定名のD1・QueueのProducer／Consumer・Workflow Bindingを設定する。
+公開URLを無効にし、呼び出し元WorkerのサービスBindingから利用する。exampleの実環境IDはGit管理外のローカル設定へ記入する。
 
 切り替え前に旧WorkflowとQueue処理の終了を確認する。action別の記録を持つ現行DBはそのまま使用できる。
 それ以前の一体型実行のDBはリセットが必要。スキーマは初期マイグレーション1つで作成する。

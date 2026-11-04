@@ -6,7 +6,7 @@
 
 A TypeScript framework for predefined workflows on Cloudflare Workflows, Queues, and D1.
 Business logic, validation, and evaluation run as independent Queue actions. D1 stores their data, verdicts, and progress.
-Each dedicated Worker hosts one Ordo class with its own D1, Queue and Workflow. Built-in Hono endpoints start Goals and expose their progress and results.
+Each dedicated Worker hosts one Ordo class with its own D1, Queue and Workflow. Built-in Hono endpoints start Goals and expose progress and results over a private service binding. No public URL is used.
 
 Changing steps during execution, AI-generated workflow changes, and deployment outside Cloudflare are out of scope.
 
@@ -46,7 +46,31 @@ export default MyWorkflow.worker();
 ```
 
 Use Wrangler's generated binding types for `Env`. Set Wrangler's `class_name` to the named Workflow export: `MyWorkflow` in this example.
-`MyWorkflow.worker()` provides both HTTP and Queue entrypoints. Applications do not need their own Hono app or startup handler.
+`MyWorkflow.worker()` provides the service-binding HTTP entrypoint and Queue handler. Applications do not need their own Hono app or startup handler.
+
+### Service binding
+
+Configure the Ordo Worker with `workers_dev: false`, `preview_urls: false`, and `routes: []`. Do not assign public routes or custom domains.
+The calling Worker declares a service binding to the deployed Ordo Worker's name:
+
+```json
+{ "services": [{ "binding": "ORDO", "service": "example-ordo" }] }
+```
+
+Declare `ORDO: Fetcher` in the caller's `Env`.
+
+```ts
+const response = await env.ORDO.fetch("https://ordo/_ordo/goals", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ value: 7 }),
+});
+const { goalId } = await response.json<{ goalId: number }>();
+const detail = await env.ORDO.fetch(`https://ordo/_ordo/goals/${goalId}`);
+const list = await env.ORDO.fetch("https://ordo/_ordo/goals");
+```
+
+The URL is required to construct a Request; it is not a public endpoint and needs no DNS configuration. The binding selects the destination Worker.
 
 ### Goal API
 
@@ -197,7 +221,7 @@ The management database is initialized and migrated automatically before process
 
 ## Development environment
 
-Use the Node.js and pnpm versions in `mise.toml`. Type checking uses `tsrs`; Cloudflare runtime verification uses Wrangler and Miniflare.
+Use the Node.js and pnpm versions in `mise.toml`. Type checking uses `tsrs`. Verify behavior against the production example deployed with Wrangler.
 Generate application binding and runtime types with `wrangler types`.
 
 ## Development
@@ -207,18 +231,18 @@ mise install
 pnpm install --frozen-lockfile
 pnpm format
 pnpm check
-pnpm --filter @cfordo/example typecheck
 ```
 
 `pnpm format` runs Prettier defaults through `npx` without adding a configuration file or dependency. It respects `.gitignore` and excludes generated types and the lockfile.
-`pnpm test` covers types, persistence, retries, resumption, parallel execution, and Workflow/Queue/D1/HTTP integration in the Workers runtime.
-Tests do not deploy to Cloudflare or call external AI APIs.
+`pnpm check` checks library types, builds the package, and checks example types. Local checks alone do not complete behavioral verification.
+Verify the production example through a service binding using the [example instructions](example/README.md).
 `pnpm build` writes ESM JavaScript, type declarations, and source maps to `dist`.
 
 ## Deployment
 
-Publish with `pnpm run deploy` using an account with npm publishing permission. Type checks, tests, and a build run before publication.
+Publish with `pnpm run deploy` using an account with npm publishing permission. Complete `pnpm check` and behavioral verification of the production example before publication.
 Deploy dedicated Workers with Wrangler using the fixed D1, Queue producer/consumer, and Workflow binding names.
+Disable public URLs and use a service binding from the calling Worker. Keep the example's real account/database IDs in its ignored local configuration.
 
 Let old Workflow and Queue processing finish before switching. Databases with per-action records can be reused.
 Databases from the earlier combined execution format require a reset. The schema is provided as a single initial migration.

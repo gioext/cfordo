@@ -4,9 +4,10 @@
   "type": "module",
   "scripts": {
     "dev": "pnpm --filter cfordo build && wrangler dev",
-    "types": "wrangler types",
-    "typecheck": "wrangler types --check && tsrs --noEmit",
-    "deploy": "pnpm --filter cfordo build && wrangler deploy"
+    "types": "wrangler types --config wrangler.example.jsonc",
+    "typecheck": "wrangler types --check --config wrangler.example.jsonc && tsrs --noEmit",
+    "deploy": "pnpm --filter cfordo build && wrangler deploy",
+    "request": "node request.mjs"
   },
   "dependencies": {
     "cfordo": "workspace:*"

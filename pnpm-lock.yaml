@@ -176,9 +176,6 @@ importers:
       esbuild:
         specifier: 0.28.2
         version: 0.28.2
-      miniflare:
-        specifier: 5.20261023.3-beta
-        version: 5.20261023.3-beta
       tsrs:
         specifier: 0.20.1-ts7.1.0-beta
         version: 0.20.1-ts7.1.0-beta

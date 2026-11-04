@@ -6,4 +6,5 @@ dist/
 .env.*
 !.env.example
 .DS_Store
-test/.build/
+/example/wrangler.jsonc
+/AGENTS.md
