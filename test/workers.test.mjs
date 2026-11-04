@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
 import { unstable_readConfig } from "wrangler";
 
-async function startRuntime(t, configUrl) {
+async function startRuntime(t, configUrl, bindings = {}) {
   const root = fileURLToPath(new URL("../", import.meta.url));
   const configPath = fileURLToPath(configUrl);
   const config = unstable_readConfig({ config: configPath });
@@ -39,6 +39,7 @@ async function startRuntime(t, configUrl) {
       name: config.name,
       compatibilityDate: config.compatibility_date,
       modules: true,
+      bindings,
       scriptPath: `${bundle}/${basename(config.main).replace(/\.ts$/, ".js")}`,
       // Never use remote bindings when testing the deployable example.
       d1Databases: Object.fromEntries(
@@ -68,103 +69,166 @@ async function startRuntime(t, configUrl) {
   return mf;
 }
 
-async function waitForResult(status) {
-  const deadline = Date.now() + 12000;
+async function json(mf, path, body) {
+  return mf.dispatchFetch(
+    `https://test${path}`,
+    body === undefined
+      ? undefined
+      : {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        },
+  );
+}
+async function startGoal(mf, input) {
+  const response = await json(mf, "/_ordo/goals", input);
+  assert.equal(response.status, 202, await response.clone().text());
+  const { goalId } = await response.json();
+  assert.equal(typeof goalId, "number");
+  assert.equal(response.headers.get("Location"), `/_ordo/goals/${goalId}`);
+  return goalId;
+}
+async function waitForGoal(mf, goalId) {
+  const deadline = Date.now() + 15000;
   let result;
   while (Date.now() < deadline) {
-    result = await status();
-    if (["complete", "errored", "terminated"].includes(result.status))
+    const response = await json(mf, `/_ordo/goals/${goalId}`);
+    assert.equal(response.status, 200, await response.clone().text());
+    result = await response.json();
+    if (["completed", "failed", "expired"].includes(result.status))
       return result;
     await delay(25);
   }
-  return result;
+  assert.fail(`Goal did not finish: ${JSON.stringify(result)}`);
 }
 
 test(
-  "packaged ESM runs with real Workflows, Queues and D1",
+  "dedicated Worker HTTP API executes success, retry, parallel and failure paths",
   { timeout: 60000 },
   async (t) => {
     const mf = await startRuntime(
       t,
       new URL("wrangler.jsonc", import.meta.url),
     );
-    for (const mode of [
-      "success",
-      "retry",
-      "parallel",
-      "expired",
-      "parallel-fail",
-    ]) {
-      const response = await mf.dispatchFetch("https://test/start", {
-        method: "POST",
-        body: JSON.stringify({ value: 7, mode }),
-      });
-      assert.equal(response.status, 200);
-      const { id } = await response.json();
-      const status = await waitForResult(async () =>
-        (
-          await mf.dispatchFetch(`https://test/status?id=${id}&mode=${mode}`)
-        ).json(),
-      );
+    const goals = [];
+    for (const mode of ["success", "retry", "parallel", "parallel-fail"]) {
+      const id = await startGoal(mf, { value: 7, mode });
+      const goal = await waitForGoal(mf, id);
+      goals.push(goal);
       assert.equal(
-        status.status,
-        "complete",
-        `${mode}: ${JSON.stringify(status)}`,
+        goal.status,
+        mode === "parallel-fail" ? "failed" : "completed",
+        JSON.stringify(goal),
       );
-      assert.equal(
-        status.output,
-        mode === "expired"
-          ? "expired"
-          : mode === "parallel-fail"
-            ? "failed"
-            : "completed",
-        `${mode}: ${JSON.stringify(status)}`,
-      );
+      assert.deepEqual(goal.input, { value: 7, mode });
+      assert.ok(goal.createdAt <= goal.finishedAt);
+      if (mode !== "parallel-fail") {
+        assert.ok(
+          goal.results.every((result) => result.status === "completed"),
+        );
+        assert.equal(
+          goal.results.find((result) => result.stepName === "extract").output
+            .value,
+          7,
+        );
+        assert.deepEqual(
+          goal.results.find((result) => result.stepName === "finalize").output,
+          { done: true },
+        );
+      }
     }
-    const db = await mf.getD1Database("DB");
-    const goals = await db
-      .prepare("SELECT * FROM cfordo_goals ORDER BY id")
-      .all();
-    assert.equal(goals.results.length, 5);
-    assert.ok(["ready", "running"].includes(goals.results[3].status));
-    const retries = await db
-      .prepare(
-        "SELECT * FROM cfordo_attempts WHERE goal_id=? AND step_name='extract' ORDER BY id",
-      )
-      .bind(goals.results[1].id)
-      .all();
-    assert.equal(retries.results.length, 2);
-    assert.equal(retries.results[0].status, "failed");
-    assert.equal(retries.results[1].status, "completed");
-    assert.equal(
-      JSON.parse(retries.results[1].output_json).feedback,
-      "try again",
+    const retry = goals[1].results.find(
+      (result) => result.stepName === "extract",
     );
-    assert.equal(goals.results[4].status, "failed");
-    const failedGoalAttempts = await db
-      .prepare("SELECT step_name FROM cfordo_attempts WHERE goal_id=?")
-      .bind(goals.results[4].id)
-      .all();
+    assert.deepEqual(
+      retry.executions.map((e) => e.action),
+      ["run", "validate", "evaluate", "run", "validate", "evaluate"],
+    );
+    assert.deepEqual(retry.executions[2].verdict, {
+      ok: false,
+      reason: "try again",
+    });
+    assert.equal(retry.output.feedback, "try again");
+    assert.deepEqual(retry.evaluation, { ok: true });
+    const failed = goals[3].results.find(
+      (result) => result.stepName === "extract",
+    );
+    assert.equal(failed.executions.length, 3);
+    assert.equal(failed.error.message, "business failure");
+    assert.equal(
+      goals[3].results.find((r) => r.stepName === "finalize").executions.length,
+      0,
+    );
+    const list = await (await json(mf, "/_ordo/goals")).json();
+    assert.equal(list.length, 4);
+    assert.deepEqual(
+      list.map((goal) => goal.goalId),
+      goals.map((goal) => goal.goalId).reverse(),
+    );
     assert.ok(
-      failedGoalAttempts.results.every((row) => row.step_name !== "finalize"),
+      list.every((goal) =>
+        goal.results.every(
+          (result) => !("executions" in result) && !("attempts" in result),
+        ),
+      ),
     );
   },
 );
 
 test(
-  "minimal example executes both parallel Queue workers",
+  "deployed example entrypoint supports concurrent independent Goals and execution history",
   { timeout: 30000 },
   async (t) => {
     const mf = await startRuntime(
       t,
       new URL("../example/wrangler.jsonc", import.meta.url),
     );
+    assert.deepEqual(await (await json(mf, "/_ordo/goals")).json(), []);
+    const inputs = [7, 11, 23];
+    const ids = await Promise.all(
+      inputs.map((value) => startGoal(mf, { value })),
+    );
+    assert.equal(new Set(ids).size, inputs.length);
+    const goals = await Promise.all(ids.map((id) => waitForGoal(mf, id)));
+    for (let i = 0; i < inputs.length; i++) {
+      const goal = goals[i];
+      assert.equal(goal.status, "completed", JSON.stringify(goal));
+      assert.equal(goal.input.value, inputs[i]);
+      assert.deepEqual(
+        goal.results.map((result) => result.output),
+        [{ value: inputs[i] * 2 }, { value: inputs[i] ** 2 }],
+      );
+      for (const result of goal.results) {
+        assert.equal(result.status, "completed");
+        assert.equal(result.action, null);
+        assert.deepEqual(result.validation, { ok: true });
+        assert.deepEqual(result.evaluation, { ok: true });
+        assert.deepEqual(
+          result.executions.map((e) => e.action),
+          ["run", "validate", "evaluate"],
+        );
+        assert.ok(
+          result.executions.every(
+            (e) => e.status === "completed" && e.error === null,
+          ),
+        );
+        const runId = result.executions[0].attemptId;
+        assert.deepEqual(
+          result.executions.map((e) => e.sourceRunId),
+          [null, runId, runId],
+        );
+      }
+    }
     const db = await mf.getD1Database("DB");
-    const { WORKFLOW } = await mf.getBindings();
-    const instance = await WORKFLOW.create({ params: { value: 7 } });
-    const status = await waitForResult(() => instance.status());
-    assert.equal(status.status, "complete", JSON.stringify(status));
-    assert.equal(status.output, "completed");
+    assert.equal(
+      (await db.prepare("SELECT count(*) AS n FROM cfordo_goals").first()).n,
+      3,
+    );
+    assert.equal(
+      (await db.prepare("SELECT count(*) AS n FROM cfordo_attempts").first()).n,
+      18,
+    );
     const versions = await db
       .prepare("SELECT id FROM cfordo_schema_versions")
       .all();
@@ -172,86 +236,44 @@ test(
       versions.results.map((row) => row.id),
       [1],
     );
-    const attempts = await db
-      .prepare(
-        "SELECT step_name,status,output_json FROM cfordo_attempts ORDER BY step_name",
-      )
-      .all();
-    assert.deepEqual(
-      attempts.results.map((row) => ({
-        step: row.step_name,
-        status: row.status,
-        value: JSON.parse(row.output_json).value,
-      })),
-      [
-        { step: "double", status: "completed", value: 14 },
-        { step: "square", status: "completed", value: 49 },
-      ],
-    );
+    assert.equal((await json(mf, "/_ordo/goals/9999")).status, 404);
+    assert.equal((await json(mf, "/_ordo/goals/nope")).status, 400);
   },
 );
 
 test(
-  "one Ordo publishes Workflow and default Queue entrypoints",
-  { timeout: 30000 },
-  async (t) => {
-    const mf = await startRuntime(
-      t,
-      new URL("combined.wrangler.jsonc", import.meta.url),
-    );
-    const { WORKFLOW } = await mf.getBindings();
-    const instances = await Promise.all(
-      [11, 23].map((value) => WORKFLOW.create({ params: { value } })),
-    );
-    const statuses = await Promise.all(
-      instances.map((instance) => waitForResult(() => instance.status())),
-    );
-    assert.deepEqual(
-      statuses.map((status) => status.output),
-      ["completed", "completed"],
-    );
-    const db = await mf.getD1Database("DB");
-    const results = await db
-      .prepare(
-        "SELECT g.input_json, a.output_json FROM cfordo_goals g JOIN cfordo_attempts a ON a.goal_id=g.id WHERE a.step_name='extract'",
-      )
-      .all();
-    assert.equal(results.results.length, 2);
-    assert.deepEqual(
-      results.results
-        .map((row) => JSON.parse(row.input_json).value)
-        .sort((a, b) => a - b),
-      [11, 23],
-    );
-    for (const row of results.results)
-      assert.equal(
-        JSON.parse(row.input_json).value,
-        JSON.parse(row.output_json).value,
-      );
-  },
-);
-
-test(
-  "Queue factories are lazy, setup runs once per instance, and configuration errors fail before processing",
+  "expiration includes the delay between HTTP acceptance and Workflow start",
   { timeout: 30000 },
   async (t) => {
     const mf = await startRuntime(
       t,
       new URL("wrangler.jsonc", import.meta.url),
+      { EXPIRES_IN: "1" },
     );
-    const response = await mf.dispatchFetch("https://test/lifecycle");
-    assert.equal(response.status, 200);
-    const result = await response.json();
-    assert.deepEqual(result.rejected, ["rejected", "rejected"]);
-    assert.equal(result.beforeReceiving, 0);
-    assert.equal(result.sharedSetup, 1);
-    assert.equal(result.separateInstances, 3);
-    assert.equal(result.failures, 1);
-    assert.match(result.missingBinding, /must call binding/);
+    const id = await startGoal(mf, { value: 7 });
+    const goal = await waitForGoal(mf, id);
+    assert.equal(goal.status, "expired");
+    assert.equal(goal.finishedAt, null);
+    assert.equal(goal.expiresAt - goal.createdAt, 1);
+  },
+);
+
+test(
+  "setup failures are rejected before Goal creation or business execution",
+  { timeout: 30000 },
+  async (t) => {
+    const mf = await startRuntime(
+      t,
+      new URL("wrangler.jsonc", import.meta.url),
+      { FAIL_SETUP: "1" },
+    );
+    const response = await json(mf, "/_ordo/goals", { value: 7 });
+    assert.equal(response.status, 500);
+    assert.equal((await response.json()).error.code, "InternalError");
     const db = await mf.getD1Database("DB");
-    assert.equal(
-      (await db.prepare("SELECT count(*) AS n FROM cfordo_attempts").first()).n,
-      0,
-    );
+    const table = await db
+      .prepare("SELECT name FROM sqlite_master WHERE name='cfordo_goals'")
+      .first();
+    assert.equal(table, null);
   },
 );

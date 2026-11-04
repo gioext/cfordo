@@ -1,23 +1,26 @@
-import { createGoal, getGoalStatus } from "./goal.ts";
-import { failGoal, runPlanner } from "./planner.ts";
+import { attachWorkflow, getGoal, updateGoal } from "../db/store.ts";
+import { recordError } from "./validation.ts";
+import { startGoal, readGoal, readGoals, getGoalStatus } from "./goal.ts";
+import { runPlanner } from "./planner.ts";
 import { createQueueConsumer, createWorker } from "./worker.ts";
 import { initOrdo } from "../db/init.ts";
 import type {
-  DatabaseBinding,
   OrdoBindings,
   OrdoOptions,
   OrdoRegistration,
   QueueHandler,
   WorkflowStepBinding,
   RegisteredStep,
-  RunStatus,
   StepDefinition,
   WorkerExecutor,
+  WorkflowIdentity,
+  GoalParams,
+  CoreEnv,
 } from "../types.ts";
 
 /** Shared registration and execution logic, independent of the Cloudflare entrypoint. */
-export class Definition implements OrdoRegistration {
-  private bindings: OrdoBindings | undefined;
+export class Definition<Params = any> implements OrdoRegistration<Params> {
+  private readonly bindings: OrdoBindings;
   private expiresIn = 24 * 60 * 60 * 1000;
   private readonly executors = new Map<string, WorkerExecutor>();
   private readonly steps = new Set<string>();
@@ -27,35 +30,28 @@ export class Definition implements OrdoRegistration {
   private readonly owner: unknown;
   readonly queue: QueueHandler<unknown>;
 
-  constructor(owner?: unknown) {
+  constructor(env: CoreEnv, owner?: unknown) {
     this.owner = owner;
+    this.bindings = { db: env?.DB, queue: env?.QUEUE, workflow: env?.WORKFLOW };
     this.queue = createQueueConsumer(this.executors, async () => {
       this.ready();
-      return this.resolveBindings();
+      return this.bindings;
     });
   }
 
-  binding(bindings: OrdoBindings): void {
-    this.assertMutable();
-    if (this.bindings) throw new Error("Bindings have already been configured");
-    if (
-      !bindings ||
-      typeof bindings !== "object" ||
-      typeof bindings.db?.prepare !== "function" ||
-      typeof bindings.db?.batch !== "function" ||
-      typeof bindings.queue?.send !== "function" ||
-      typeof bindings.workflow?.get !== "function"
-    ) {
-      throw new TypeError("binding() requires db, queue and workflow bindings");
-    }
-    if (
-      Object.keys(bindings).some(
-        (key) => !["db", "queue", "workflow"].includes(key),
-      )
-    ) {
-      throw new TypeError("binding() only accepts db, queue and workflow");
-    }
-    this.bindings = Object.freeze({ ...bindings });
+  async start(input: unknown): Promise<number> {
+    this.ready();
+    return startGoal(this.bindings, input, this.expiresIn);
+  }
+
+  async list() {
+    this.ready();
+    return readGoals(this.bindings, this.playbook.flat());
+  }
+
+  async get(id: number) {
+    this.ready();
+    return readGoal(this.bindings, this.playbook.flat(), id);
   }
 
   configure(options: OrdoOptions): void {
@@ -76,7 +72,7 @@ export class Definition implements OrdoRegistration {
     this.expiresIn = expiresIn;
   }
 
-  step(definition: StepDefinition): void {
+  step<Result = any>(definition: StepDefinition<Params, Result>): void {
     this.assertMutable();
     if (
       !definition ||
@@ -124,7 +120,14 @@ export class Definition implements OrdoRegistration {
   ready(): void {
     if (this.group)
       throw new Error("Await parallel registration before execution");
-    this.resolveBindings();
+    if (
+      typeof this.bindings.db?.prepare !== "function" ||
+      typeof this.bindings.db?.batch !== "function" ||
+      typeof this.bindings.queue?.send !== "function" ||
+      typeof this.bindings.workflow?.get !== "function" ||
+      typeof this.bindings.workflow?.create !== "function"
+    )
+      throw new TypeError("Ordo requires DB, QUEUE and WORKFLOW bindings");
     if (!this.steps.size) throw new Error("At least one Step is required");
     this.frozen = true;
   }
@@ -157,52 +160,46 @@ export class Definition implements OrdoRegistration {
   }
 
   async run(
-    event: { instanceId: string; payload: unknown },
+    event: WorkflowIdentity & { payload: GoalParams },
     step: WorkflowStepBinding,
-  ): Promise<RunStatus> {
-    let goalId: number | undefined;
-    let db: DatabaseBinding | undefined;
+  ): Promise<void> {
+    this.ready();
+    const bindings = this.bindings;
+    if (!step || !event?.instanceId || !event.workflowName)
+      throw new Error("run requires a Workflow event and step");
+    await initOrdo(bindings.db);
+    if (
+      !Number.isSafeInteger(event.payload?.goalId) ||
+      event.payload.goalId <= 0
+    )
+      throw new TypeError("Workflow requires a positive Goal ID");
+    await attachWorkflow(
+      bindings.db,
+      event.payload.goalId,
+      event.instanceId,
+      event.workflowName,
+    );
+    const goal = await getGoal(bindings.db, event.payload.goalId);
+    const status = getGoalStatus(goal);
+    if (status === "completed" || status === "failed" || status === "expired")
+      return;
     try {
-      this.ready();
-      const bindings = this.resolveBindings();
-      db = bindings.db;
-      const { queue } = bindings;
-      const expiresIn = this.expiresIn;
-      if (!step || !event?.instanceId)
-        throw new Error("run requires a Workflow event and step");
-      await initOrdo(db);
-      const goal = await createGoal(
-        db,
-        step,
-        "ordo:goal:0",
-        event.payload,
-        expiresIn,
-      );
-      goalId = goal.id;
-      const status = getGoalStatus(goal);
-      if (status === "completed" || status === "failed" || status === "expired")
-        return status;
-      return await runPlanner(
-        { db, queue, step, event },
+      await runPlanner(
+        { db: bindings.db, queue: bindings.queue, step, event },
         goal.id,
         this.playbook,
       );
-    } catch {
-      if (goalId !== undefined && db) {
-        try {
-          return await failGoal(db, goalId);
-        } catch {
-          // A live caller still gets a status even if failure cannot be stored.
-        }
-      }
-      return "failed";
+    } catch (error) {
+      if (getGoalStatus(await getGoal(bindings.db, goal.id)) === "expired")
+        return;
+      await updateGoal(
+        bindings.db,
+        goal.id,
+        "failed",
+        recordError(error, "configuration"),
+      );
+      throw error;
     }
-  }
-
-  private resolveBindings(): OrdoBindings {
-    if (!this.bindings)
-      throw new Error("setup() must call binding() before execution");
-    return this.bindings;
   }
 
   private assertMutable(): void {

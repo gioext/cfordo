@@ -13,30 +13,32 @@ CREATE TABLE cfordo_schema_versions (
 -- expired is derived from status and expires_at; it is not stored in status.
 CREATE TABLE cfordo_goals (
   id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+  workflow_name TEXT,
+  instance_id TEXT,
   input_json TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'ready',
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL,
-  finished_at INTEGER
+  finished_at INTEGER,
+  error_json TEXT
 );
 
--- One row per Engine launch. Only the Engine inserts launch records.
--- Worker and Engine update the record.
--- ready -> running -> validating -> evaluating -> completed / failed
--- Worker sets running before run and validating before output/Validation.
--- Engine sets evaluating before Evaluation and completed after success.
--- Engine alone finalizes completed/failed after reading persisted results.
--- The Engine allocates id in launch order; id is WorkerContext.attemptId.
--- The Worker wrapper writes business output, output checks and Validation.
--- The Worker wrapper sends a completion event only after persisting results.
--- The event wakes the Engine, which reads DB values and records Evaluation.
--- Check results are {ok, reason}; error_json includes the failing operation.
+CREATE UNIQUE INDEX cfordo_goals_workflow_instance
+  ON cfordo_goals(workflow_name, instance_id)
+  WHERE workflow_name IS NOT NULL AND instance_id IS NOT NULL;
+
+-- One row per run, validate or evaluate action.
+-- ready -> running -> completed / failed
+-- Results are persisted before completion is notified to the Workflow.
 -- SQL NULL means no accepted output is stored; JSON null is the text 'null'.
 CREATE TABLE cfordo_attempts (
   id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
   goal_id INTEGER NOT NULL REFERENCES cfordo_goals(id),
   step_name TEXT NOT NULL,
   worker_name TEXT NOT NULL,
+  action TEXT,
+  predecessor_id INTEGER REFERENCES cfordo_attempts(id),
+  source_run_id INTEGER REFERENCES cfordo_attempts(id),
   status TEXT NOT NULL DEFAULT 'ready',
   output_json TEXT,
   output_check_json TEXT,
@@ -50,8 +52,9 @@ CREATE TABLE cfordo_attempts (
 CREATE INDEX cfordo_attempts_goal_step_order
   ON cfordo_attempts(goal_id, step_name, id);
 
--- Update the active status before executing its corresponding processing.
--- Persist terminal status and its associated results in the same UPDATE.
--- State reads use the latest id for a Goal/Step; prior launches remain history.
--- Feedback is assembled from prior check results for the same Goal/Step.
--- A new Engine launch inserts a new row instead of resetting a prior row.
+CREATE UNIQUE INDEX cfordo_attempts_first_action
+  ON cfordo_attempts(goal_id, step_name)
+  WHERE action IS NOT NULL AND predecessor_id IS NULL;
+CREATE UNIQUE INDEX cfordo_attempts_next_action
+  ON cfordo_attempts(predecessor_id)
+  WHERE predecessor_id IS NOT NULL;

@@ -11,37 +11,14 @@
     },
   ],
   "queues": {
-    "producers": [
-      {
-        "binding": "JOBS",
-        "queue": "cfordo-test-jobs",
-      },
-      {
-        "binding": "EXPIRED_JOBS",
-        "queue": "cfordo-test-expired-jobs",
-      },
-    ],
-    "consumers": [
-      {
-        "queue": "cfordo-test-jobs",
-        "max_batch_timeout": 0,
-      },
-      {
-        "queue": "cfordo-test-expired-jobs",
-        "max_batch_timeout": 0,
-      },
-    ],
+    "producers": [{ "binding": "QUEUE", "queue": "cfordo-test-jobs" }],
+    "consumers": [{ "queue": "cfordo-test-jobs", "max_batch_timeout": 0 }],
   },
   "workflows": [
     {
       "binding": "WORKFLOW",
       "name": "cfordo-test-workflow",
       "class_name": "TestWorkflow",
-    },
-    {
-      "binding": "EXPIRED_WORKFLOW",
-      "name": "cfordo-test-expired-workflow",
-      "class_name": "ExpiredWorkflow",
     },
   ],
 }

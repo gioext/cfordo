@@ -1,37 +1,35 @@
 export type JsonValue =
   null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type GoalStatus = "ready" | "running" | "completed" | "failed";
-export type RunStatus = "completed" | "failed" | "expired";
 export type EffectiveGoalStatus = GoalStatus | "expired";
-export type AttemptStatus =
-  "ready" | "running" | "validating" | "evaluating" | "completed" | "failed";
-export type CheckSource = "validate" | "evaluate";
+export type Action = "run" | "validate" | "evaluate";
+export type CheckSource = Exclude<Action, "run">;
+export type AttemptStatus = "ready" | "running" | "completed" | "failed";
 
-export interface OrdoContext {
-  /** Optional type arguments describe the value; they do not validate it. */
-  params<T = any>(): T;
-  /** Undefined during run(), otherwise the business result being checked. */
-  result<T = any>(): T;
-  ok(): CheckDecision;
-  ng(reason: string): CheckDecision;
-  goalId: number;
-  stepName: string;
-  attemptId: number;
-  feedback?: { source: CheckSource; reason: string };
+export interface OrdoContext<
+  Params = any,
+  Result = any,
+  Phase extends Action = Action,
+> {
+  input(): { params: Params; result: Phase extends "run" ? undefined : Result };
+  complete: Phase extends "run" ? (value: Result) => Promise<void> : never;
+  ok: Phase extends "run" ? never : () => Promise<void>;
+  ng: Phase extends "run" ? never : (reason: string) => Promise<void>;
+  readonly goalId: number;
+  readonly stepName: string;
+  readonly attemptId: number;
+  readonly feedback?: { source: CheckSource; reason: string };
 }
 
-declare const decisionBrand: unique symbol;
-/** Only context.ok()/ng() can create a check decision. */
-export interface CheckDecision {
-  readonly [decisionBrand]: true;
-}
-export type CheckFunction = (ctx: OrdoContext) => Promise<CheckDecision>;
+export type CheckFunction<Params = any, Result = any> = (
+  ctx: OrdoContext<Params, Result, CheckSource>,
+) => Promise<void>;
 
-export interface StepDefinition {
+export interface StepDefinition<Params = any, Result = any> {
   name: string;
-  run(ctx: OrdoContext): Promise<unknown>;
-  validate?: CheckFunction;
-  evaluate?: CheckFunction;
+  run(ctx: OrdoContext<Params, Result, "run">): Promise<void>;
+  validate?: CheckFunction<Params, Result>;
+  evaluate?: CheckFunction<Params, Result>;
 }
 
 // Only the structural subset used by cfordo is required of Cloudflare bindings.
@@ -61,20 +59,41 @@ export interface QueueBinding {
 }
 
 export interface WorkflowStepBinding {
-  do<Value extends JsonValue>(
+  do(
     name: string,
     config: { retries: { limit: number; delay: number } },
-    callback: () => Promise<Value>,
-  ): Promise<Value>;
+    callback: () => Promise<void>,
+  ): Promise<void>;
   waitForEvent(
     name: string,
     options: { type: string },
   ): Promise<{ payload: unknown }>;
 }
 
+export interface GoalParams {
+  goalId: number;
+}
+
+export interface OrdoEnv {
+  DB: D1Database;
+  QUEUE: Queue;
+  WORKFLOW: Workflow<GoalParams>;
+}
+
+export interface CoreEnv {
+  DB: DatabaseBinding;
+  QUEUE: QueueBinding;
+  WORKFLOW: WorkflowBinding;
+}
+
 export interface WorkflowBinding {
+  create(options: { params: GoalParams }): Promise<{ id: string }>;
   get(id: string): Promise<{
     sendEvent(event: { type: string; payload: unknown }): Promise<void>;
+    status(): Promise<{
+      status: InstanceStatus["status"];
+      error?: { message: string; name: string };
+    }>;
   }>;
 }
 
@@ -115,10 +134,9 @@ export interface OrdoOptions {
   expiresIn?: number;
 }
 
-export interface OrdoRegistration {
-  binding(bindings: OrdoBindings): void;
+export interface OrdoRegistration<Params = any> {
   configure(options: OrdoOptions): void;
-  step(definition: StepDefinition): void;
+  step<Result = any>(definition: StepDefinition<Params, Result>): void;
   parallel(callback: () => Promise<void>): Promise<void>;
 }
 
@@ -129,6 +147,9 @@ export type CheckResult = { ok: true } | { ok: false; reason: string };
 export interface Goal {
   id: number;
   input: JsonValue;
+  error: AttemptError | null;
+  workflowName: string | null;
+  instanceId: string | null;
   status: GoalStatus;
   createdAt: number;
   expiresAt: number;
@@ -141,12 +162,16 @@ export interface AttemptError {
   name: string;
   message: string;
   fatal?: boolean;
+  stack?: string;
 }
 
 export interface Attempt {
   id: number;
   goalId: number;
   stepName: string;
+  action: Action | null;
+  predecessorId: number | null;
+  sourceRunId: number | null;
   status: AttemptStatus;
   output: JsonValue | undefined;
   validation: CheckResult | null;
@@ -157,28 +182,25 @@ export interface Attempt {
 }
 
 export type RegisteredStep = StepDefinition;
-export type WorkerDefinition = Pick<StepDefinition, "run" | "validate">;
 
 export type Playbook = readonly (readonly RegisteredStep[])[];
-export type ResumePhase = "validate" | "evaluate";
 export interface Intent {
-  protocol: "cfordo/1";
-  goalId: number;
-  stepName: string;
+  protocol: "cfordo/2";
   attemptId: number;
+}
+
+export interface WorkflowIdentity {
+  workflowName: string;
   instanceId: string;
-  feedback?: OrdoContext["feedback"];
-  resume?: { phase: ResumePhase; attemptId: number };
 }
 
 export interface Runtime {
   db: DatabaseBinding;
   queue: QueueBinding;
   step: WorkflowStepBinding;
-  event: { instanceId: string };
+  event: WorkflowIdentity;
 }
 
-export type AttemptOutcome = "completed" | "retry" | "failed" | "expired";
 export type WorkerExecutor = (
   intent: Intent,
   bindings: OrdoBindings,
@@ -190,4 +212,52 @@ export const NO_WORKFLOW_RETRIES = { retries: { limit: 0, delay: 0 } } as const;
 
 export function completionType(attemptId: number): string {
   return `ordo-completed-${attemptId}`;
+}
+
+/** HTTP responses. Execution history is present only on the detail endpoint. */
+export interface ErrorInfo {
+  code: string;
+  message: string;
+}
+export interface ExecutionDetail {
+  attemptId: number;
+  action: Action;
+  sourceRunId: number | null;
+  status: AttemptStatus;
+  output: JsonValue;
+  verdict: CheckResult | null;
+  error: ErrorInfo | null;
+  createdAt: number;
+  finishedAt: number | null;
+}
+export interface StepResult {
+  stepName: string;
+  status: EffectiveGoalStatus;
+  action: Action | null;
+  output: JsonValue;
+  validation: CheckResult | null;
+  evaluation: CheckResult | null;
+  error: ErrorInfo | null;
+  createdAt: number | null;
+  finishedAt: number | null;
+}
+export interface GoalSummary {
+  goalId: number;
+  input: JsonValue;
+  status: EffectiveGoalStatus;
+  createdAt: number;
+  expiresAt: number;
+  finishedAt: number | null;
+  error: ErrorInfo | null;
+  results: StepResult[];
+}
+export interface GoalDetail extends GoalSummary {
+  results: (StepResult & { executions: ExecutionDetail[] })[];
+}
+export interface GoalCreated {
+  goalId: number;
+}
+export interface ApiErrorResponse {
+  error: ErrorInfo;
+  goalId?: number;
 }

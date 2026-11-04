@@ -3,7 +3,7 @@
   "account_id": "36d2a7cb8e8c8b4d0a93e0cf69ed76f4",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-23",
-  "workers_dev": false,
+  "workers_dev": true,
   "preview_urls": false,
   "d1_databases": [
     {

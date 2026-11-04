@@ -33,15 +33,14 @@
     "prepack": "pnpm build",
     "prepublishOnly": "pnpm check",
     "deploy": "pnpm publish --access public",
-    "test:core": "esbuild test/entry.ts --bundle --format=esm --platform=node --packages=external --loader:.sql=text --outfile=test/.build/core.mjs && node --test test/ordo.test.mjs test/context.test.mjs test/core/*.test.mjs test/db/*.test.mjs"
+    "test:core": "esbuild test/entry.ts --bundle --format=esm --platform=node --packages=external --loader:.sql=text --outfile=test/.build/core.mjs && node --test test/api.test.mjs test/ordo.test.mjs test/context.test.mjs test/core/*.test.mjs test/db/*.test.mjs"
   },
   "dependencies": {
-    "cfqu": "^0.1.1"
+    "hono": "4.13.14"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20261030.1",
     "esbuild": "0.28.2",
-    "hono": "4.13.14",
     "miniflare": "5.20261023.3-beta",
     "tsrs": "0.20.1-ts7.1.0-beta",
     "wrangler": "4.156.0"

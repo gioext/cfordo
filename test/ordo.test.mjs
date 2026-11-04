@@ -1,28 +1,31 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Ordo } from "./.build/core.mjs";
-import { harness, queueBatch, queueMessage, seedAttempt } from "./fixtures.mjs";
+import { harness, queueBatch, seedAttempt, queueMessage } from "./fixtures.mjs";
+const run = async (ctx) => {
+  await ctx.complete(null);
+};
 
-const run = async () => null;
-
-test("registration rejects invalid definitions without launching a Goal", async (t) => {
+test("invalid definitions and duplicate names are rejected before business execution", async (t) => {
   const h = await harness(t);
-  assert.throws(() => h.workflow.step({ name: "", run }));
-  for (const key of ["success", "failure", "next", "output", "worker"]) {
-    assert.throws(() => h.workflow.step({ name: "x", run, [key]: "y" }));
-  }
-  h.workflow.step({ name: "x", run });
+  for (const definition of [
+    { name: "", run },
+    { name: "missing" },
+    { name: "old", run, worker: "x" },
+    { name: "old", run, output: {} },
+  ])
+    assert.throws(() => h.workflow.step(definition));
+  h.workflow.step({ name: "job", run });
   assert.throws(
-    () => h.workflow.step({ name: "x", run }),
+    () => h.workflow.step({ name: "job", run }),
     /already registered/,
   );
-  assert.throws(() => h.workflow.step({ name: "missing" }), /run function/);
   assert.equal(h.db.rows("cfordo_goals").length, 0);
-  assert.equal(h.db.rows("cfordo_attempts").length, 0);
 });
 
-test("parallel registration is async, rejects nesting and rolls back steps and executors", async (t) => {
+test("parallel registration rejects empty/nested/synchronous groups and rolls back definitions", async (t) => {
   const h = await harness(t);
+  let wrong = 0;
   await assert.rejects(
     h.workflow.parallel(async () => {}),
     /contain a Step/,
@@ -31,14 +34,13 @@ test("parallel registration is async, rejects nesting and rolls back steps and e
     h.workflow.parallel(() => undefined),
     /asynchronous/,
   );
-  let rolledBackRuns = 0;
   await assert.rejects(
     h.workflow.parallel(async () => {
       h.workflow.step({
-        name: "reusable",
-        run: async () => {
-          rolledBackRuns++;
-          return null;
+        name: "job",
+        run: async (ctx) => {
+          wrong++;
+          await ctx.complete(null);
         },
       });
       await h.workflow.parallel(async () => {});
@@ -46,95 +48,103 @@ test("parallel registration is async, rejects nesting and rolls back steps and e
     /Nested/,
   );
   await h.workflow.parallel(async () => {
-    await Promise.resolve();
-    h.workflow.step({ name: "reusable", run });
+    h.workflow.step({ name: "job", run });
   });
-  assert.equal(await h.run({}), "completed");
-  assert.equal(rolledBackRuns, 0);
+  await h.run({});
+  assert.equal(await h.status(), "completed");
+  assert.equal(wrong, 0);
   assert.throws(() => h.workflow.step({ name: "after", run }), /cannot change/);
   assert.throws(
     () => h.workflow.configure({ expiresIn: 1000 }),
     /cannot change/,
   );
-  assert.throws(
-    () => h.workflow.binding(h.configuration.bindings),
-    /cannot change/,
-  );
 });
 
-test("binding is mandatory and all three resources are checked before execution", async (t) => {
+test("all three bindings and a nonempty playbook are required", async (t) => {
   const h = await harness(t);
-  const definition = new Ordo();
-  definition.step({ name: "x", run });
-  assert.throws(() => definition.ready(), /must call binding/);
-  for (const key of ["db", "queue", "workflow"]) {
-    const bindings = { ...h.configuration.bindings };
-    delete bindings[key];
-    assert.throws(
-      () => definition.binding(bindings),
-      /requires db, queue and workflow/,
-    );
+  for (const key of ["DB", "QUEUE", "WORKFLOW"]) {
+    const env = { ...h.env };
+    delete env[key];
+    const definition = new Ordo(env);
+    definition.step({ name: "job", run });
+    assert.throws(() => definition.ready(), /requires/);
   }
-  definition.binding(h.configuration.bindings);
-  assert.throws(
-    () => definition.binding(h.configuration.bindings),
-    /already been configured/,
-  );
-  definition.ready();
+  assert.throws(() => h.workflow.ready(), /At least one/);
+});
+
+test("lifetime configuration and initial JSON are checked before creating a Goal", async (t) => {
+  const h = await harness(t);
+  for (const expiresIn of [0, -1, 1.5, Infinity, "1000"])
+    assert.throws(() => h.workflow.configure({ expiresIn }), /positive/);
+  h.workflow.step({ name: "job", run });
+  await assert.rejects(h.run({ invalid: undefined }), /JSON/);
   assert.equal(h.db.rows("cfordo_goals").length, 0);
 });
 
-test("configuration validates lifetime and no Steps or invalid JSON cannot launch a Goal", async (t) => {
-  const h = await harness(t);
-  for (const expiresIn of [0, -1, 1.5, Infinity, "1000"]) {
-    assert.throws(() => h.workflow.configure({ expiresIn }), /positive number/);
-  }
-  assert.equal(await h.run({}), "failed");
-  h.workflow.step({ name: "x", run });
-  assert.equal(await h.run({ invalid: undefined }), "failed");
-  assert.equal(h.db.rows("cfordo_goals").length, 0);
+test("registration performs no I/O and execution migrates the database automatically", async (t) => {
+  const h = await harness(t, { initialize: false });
+  h.workflow.step({
+    name: "job",
+    run: async (ctx) => {
+      assert.deepEqual(
+        h.db.rows("cfordo_schema_versions").map((row) => row.id),
+        [1],
+      );
+      await ctx.complete(ctx.input().params);
+    },
+  });
+  assert.equal(
+    h.db.sqlite
+      .prepare(
+        "SELECT count(*) AS n FROM sqlite_master WHERE name LIKE 'cfordo_%'",
+      )
+      .get().n,
+    0,
+  );
+  await h.run({ value: 7 });
+  assert.equal(await h.status(), "completed");
 });
 
-test(
-  "binding and registration perform no I/O; execution initializes the database",
-  { timeout: 3000 },
-  async (t) => {
-    const h = await harness(t, { initialize: false });
-    h.workflow.step({
-      name: "extract",
-      run: async (ctx) => {
-        assert.deepEqual(
-          h.db.rows("cfordo_schema_versions").map((row) => row.id),
-          [1],
-        );
-        return ctx.params();
-      },
-    });
-    assert.equal(
-      h.db.sqlite
-        .prepare(
-          "SELECT count(*) AS n FROM sqlite_master WHERE name LIKE 'cfordo_%'",
-        )
-        .get().n,
-      0,
-    );
-    assert.equal(await h.run({ value: 7 }), "completed");
-    assert.equal(h.db.rows("cfordo_goals")[0].status, "completed");
-  },
-);
-
-test("omitted configure uses a 24-hour lifetime", async (t) => {
+test("configure is optional and defaults to 24 hours", async (t) => {
   const h = await harness(t);
-  const definition = new Ordo();
-  definition.binding(h.configuration.bindings);
-  definition.step({ name: "extract", run });
-  h.consumer.step({ name: "extract", run });
-  assert.equal(await h.replay(definition, {}), "completed");
-  const goal = h.db.rows("cfordo_goals")[0];
-  assert.equal(goal.expires_at - goal.created_at, 86400000);
+  const definition = new Ordo(h.env);
+  definition.step({ name: "job", run });
+  h.consumer.step({ name: "job", run });
+  await h.replay(definition, {});
+  const goal = await h.goal();
+  assert.equal(goal.expiresAt - goal.createdAt, 86400000);
 });
 
-test("concurrent deliveries use their own context and configured notification destination", async (t) => {
+test("same saved function can be reused by two steps with its instance binding intact", async (t) => {
+  const h = await harness(t);
+  const owner = {
+    factor: 3,
+    async process(ctx) {
+      await ctx.complete(ctx.input().params.value * this.factor);
+    },
+    async check(ctx) {
+      assert.equal(ctx.input().result, 7 * this.factor);
+      await ctx.ok();
+    },
+  };
+  const definition = h.newDefinition(owner);
+  definition.step({ name: "a", run: owner.process, validate: owner.check });
+  definition.step({ name: "b", run: owner.process, evaluate: owner.check });
+  h.consumer.step({
+    name: "a",
+    run: owner.process.bind(owner),
+    validate: owner.check.bind(owner),
+  });
+  h.consumer.step({
+    name: "b",
+    run: owner.process.bind(owner),
+    evaluate: owner.check.bind(owner),
+  });
+  await h.replay(definition, { value: 7 });
+  assert.equal(await h.status(), "completed");
+});
+
+test("concurrent deliveries keep params and notification destinations separate", async (t) => {
   const h = await harness(t);
   const gate = Promise.withResolvers();
   let arrivals = 0;
@@ -143,56 +153,45 @@ test("concurrent deliveries use their own context and configured notification de
     run: async (ctx) => {
       if (++arrivals === 2) gate.resolve();
       await gate.promise;
-      return ctx.params();
+      await ctx.complete(ctx.input().params);
     },
   });
-  const first = seedAttempt(h.db, { input: { tenant: "a" } });
-  const second = seedAttempt(h.db, { input: { tenant: "b" } });
-  const messageA = queueMessage(h.intent(first.attemptId, { instanceId: "a" }));
-  const messageB = queueMessage(
-    h.intent(second.attemptId, { instanceId: "b" }),
+  const a = seedAttempt(h.db, { input: { tenant: "a" }, instanceId: "a" });
+  const b = seedAttempt(h.db, { input: { tenant: "b" }, instanceId: "b" });
+  await Promise.all(
+    [a, b].map((item) =>
+      h.consumer.queue(
+        queueBatch([queueMessage(h.intent(item.attemptId))]),
+        {},
+        { waitUntil() {} },
+      ),
+    ),
   );
-  const handler = { queue: h.consumer.queue };
-  await Promise.all([
-    handler.queue(queueBatch([messageA]), {}, { waitUntil() {} }),
-    handler.queue(queueBatch([messageB]), {}, { waitUntil() {} }),
-  ]);
-  assert.equal(messageA.acknowledged, true);
-  assert.equal(messageB.acknowledged, true);
+  assert.deepEqual(h.destinations.sort(), ["a", "b"]);
   assert.deepEqual(
     h.db.rows("cfordo_attempts").map((row) => JSON.parse(row.output_json)),
     [{ tenant: "a" }, { tenant: "b" }],
   );
-  assert.equal(h.hub.events.length, 2);
-  assert.deepEqual(h.destinations.sort(), ["a", "b"]);
 });
 
-test("initialization failure prevents run and queue from invoking business work", async (t) => {
+test("initialization failure starts no business logic", async (t) => {
   const h = await harness(t, { initialize: false });
-  let runs = 0;
+  let called = false;
+  h.workflow.step({
+    name: "job",
+    run: async (ctx) => {
+      called = true;
+      await ctx.complete(null);
+    },
+  });
   h.db.before = (sql) => {
     if (sql.startsWith("CREATE TABLE cfordo_goals"))
       throw new Error("migration unavailable");
   };
-  h.workflow.step({
-    name: "extract",
-    run: async () => {
-      runs++;
-      return {};
-    },
-  });
-  assert.equal(await h.run({}), "failed");
-  const message = queueMessage({
-    protocol: "cfordo/1",
-    goalId: 1,
-    attemptId: 1,
-    stepName: "extract",
-    instanceId: "workflow-1",
-  });
+  await assert.rejects(h.run({}), /migration unavailable/);
   await assert.rejects(
-    h.consumer.queue(queueBatch([message]), {}, { waitUntil() {} }),
+    h.consumer.queue(queueBatch([]), {}, { waitUntil() {} }),
     /migration unavailable/,
   );
-  assert.equal(runs, 0);
-  assert.equal(h.hub.events.length, 0);
+  assert.equal(called, false);
 });

@@ -3,31 +3,28 @@ import {
   type WorkflowEvent,
   type WorkflowStep,
 } from "cloudflare:workers";
+import { createApi } from "./api.ts";
 import { Definition } from "./core/definition.ts";
 import type {
-  OrdoBindings,
+  GoalParams,
+  OrdoEnv,
   OrdoOptions,
-  QueueBatch,
-  RunStatus,
   StepDefinition,
 } from "./types.ts";
 
-export abstract class Ordo<Env = unknown> extends WorkflowEntrypoint<
-  Env,
-  unknown
-> {
-  private readonly definition = new Definition(this);
+export abstract class Ordo<
+  Env extends OrdoEnv = OrdoEnv,
+  Params = any,
+> extends WorkflowEntrypoint<Env, GoalParams> {
+  private readonly definition = new Definition<Params>(this.env, this);
   private initialization: Promise<void> | undefined;
 
   abstract setup(): Promise<void>;
 
-  binding(bindings: OrdoBindings): void {
-    this.definition.binding(bindings);
-  }
   configure(options: OrdoOptions): void {
     this.definition.configure(options);
   }
-  step(step: StepDefinition): void {
+  step<Result = any>(step: StepDefinition<Params, Result>): void {
     this.definition.step(step);
   }
   parallel(callback: () => Promise<void>): Promise<void> {
@@ -35,36 +32,35 @@ export abstract class Ordo<Env = unknown> extends WorkflowEntrypoint<
   }
 
   async run(
-    event: WorkflowEvent<unknown>,
+    event: WorkflowEvent<GoalParams>,
     step: WorkflowStep,
-  ): Promise<RunStatus> {
+  ): Promise<void> {
     await this.prepare();
-    return this.definition.run(event, step);
+    await this.definition.run(event, step);
   }
 
-  async queue(batch: QueueBatch): Promise<void> {
-    await this.prepare();
-    return this.definition.queue(batch, this.env, this.ctx);
-  }
-
-  /** Creates a handler now, and a fresh subclass instance for each Queue event. */
-  static queue<Bindings>(
-    this: new (ctx: ExecutionContext, env: Bindings) => Ordo<Bindings>,
-  ): (
-    batch: QueueBatch,
-    env: Bindings,
-    ctx: ExecutionContext,
-  ) => Promise<void> {
+  /** One dedicated Worker provides this Ordo's HTTP and Queue entrypoints. */
+  static worker<Env extends OrdoEnv>(
+    this: new (ctx: ExecutionContext, env: Env) => Ordo<Env, any>,
+  ): ExportedHandler<Env> {
     const Entrypoint = this;
-    return async function (batch, env, ctx) {
+    const resolve = async (env: Env, ctx: ExecutionContext) => {
       const instance = new Entrypoint(ctx, env);
-      await instance.queue(batch);
+      await instance.prepare();
+      return instance.definition;
+    };
+    const app = createApi(resolve);
+    return {
+      fetch: (request, env, ctx) => app.fetch(request, env, ctx),
+      queue: async (batch, env, ctx) => {
+        const definition = await resolve(env, ctx);
+        await definition.queue(batch, env, ctx);
+      },
     };
   }
 
   private prepare(): Promise<void> {
-    // Defer setup until after construction, when subclass fields and env exist.
-    // Concurrent calls share setup; failure stays failed on this instance.
+    // Setup runs after subclass fields initialize and once per instance.
     return (this.initialization ??= Promise.resolve().then(async () => {
       const pending = this.setup();
       if (!pending || typeof pending.then !== "function")

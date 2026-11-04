@@ -1,55 +1,53 @@
+import { saveOutcome } from "../db/store.ts";
 import type {
+  Attempt,
   AttemptError,
-  CheckDecision,
-  CheckFunction,
-  CheckResult,
+  DatabaseBinding,
   ErrorSource,
   JsonValue,
   OrdoContext,
 } from "../types.ts";
 
-// Identity-based decisions prevent arbitrary return objects from being accepted.
-// The marker also makes returning a decision as business JSON an explicit error.
-const marker = Symbol("check decision");
-const contexts = new WeakMap<OrdoContext, WeakMap<object, CheckResult>>();
-
 export function createContext(
-  details: Pick<OrdoContext, "goalId" | "stepName" | "attemptId" | "feedback">,
+  db: DatabaseBinding,
+  attempt: Attempt,
   params: JsonValue,
-  result?: JsonValue,
+  result: JsonValue | undefined,
+  feedback?: OrdoContext["feedback"],
 ): OrdoContext {
-  const decisions = new WeakMap<object, CheckResult>();
-  function decision(value: CheckResult): CheckDecision {
-    const token = Object.freeze({ [marker]: true });
-    decisions.set(token, value);
-    return token as unknown as CheckDecision;
-  }
-  const ctx: OrdoContext = Object.freeze({
-    ...details,
-    params<T = any>(): T {
-      return structuredClone(params) as T;
+  return Object.freeze({
+    goalId: attempt.goalId,
+    stepName: attempt.stepName,
+    attemptId: attempt.id,
+    ...(feedback ? { feedback: Object.freeze({ ...feedback }) } : {}),
+    input() {
+      return structuredClone({ params, result });
     },
-    result<T = any>(): T {
-      return structuredClone(result) as T;
+    async complete(value: unknown): Promise<void> {
+      if (attempt.action !== "run")
+        throw new TypeError("complete() is only available to run");
+      assertJson(value, "Business result");
+      await saveOutcome(db, attempt.id, "run", value);
     },
-    ok(): CheckDecision {
+    async ok(): Promise<void> {
       if (arguments.length !== 0)
         throw new TypeError("ok() does not accept arguments");
-      return decision({ ok: true });
+      if (attempt.action !== "validate" && attempt.action !== "evaluate")
+        throw new TypeError("ok() is only available to checks");
+      await saveOutcome(db, attempt.id, attempt.action, { ok: true });
     },
-    ng(reason: string): CheckDecision {
+    async ng(reason: string): Promise<void> {
       if (
         arguments.length !== 1 ||
         typeof reason !== "string" ||
         !reason.trim()
-      ) {
+      )
         throw new TypeError("ng() requires one non-empty reason");
-      }
-      return decision({ ok: false, reason });
+      if (attempt.action !== "validate" && attempt.action !== "evaluate")
+        throw new TypeError("ng() is only available to checks");
+      await saveOutcome(db, attempt.id, attempt.action, { ok: false, reason });
     },
   });
-  contexts.set(ctx, decisions);
-  return ctx;
 }
 
 export function assertJson(
@@ -85,20 +83,6 @@ export function assertJson(
   visit(value);
 }
 
-export async function runCheck(
-  fn: CheckFunction,
-  ctx: OrdoContext,
-): Promise<CheckResult> {
-  const decision = await fn(ctx);
-  const result =
-    decision && typeof decision === "object"
-      ? contexts.get(ctx)?.get(decision)
-      : undefined;
-  if (!result)
-    throw new TypeError("A check must return its context's ok() or ng(reason)");
-  return result;
-}
-
 export function recordError(
   error: unknown,
   source: ErrorSource,
@@ -108,6 +92,7 @@ export function recordError(
     source,
     name: error instanceof Error ? error.name : "Error",
     message: error instanceof Error ? error.message : String(error),
+    ...(error instanceof Error && error.stack ? { stack: error.stack } : {}),
     ...extra,
   };
 }

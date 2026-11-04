@@ -1,221 +1,141 @@
-import { Qu } from "cfqu";
 import { initOrdo } from "../db/init.ts";
 import {
   claimAttempt,
+  failAttempt,
+  finishAttempt,
   getAttempt,
   getGoal,
-  updateAttempt,
-  type AttemptPatch,
+  listAttempts,
 } from "../db/store.ts";
 import {
   completionType,
   type Attempt,
   type Intent,
   type OrdoBindings,
+  type OrdoContext,
   type QueueBatch,
   type QueueHandler,
-  type WorkerDefinition,
+  type RegisteredStep,
   type WorkerExecutor,
 } from "../types.ts";
 import { getGoalStatus } from "./goal.ts";
-import {
-  assertJson,
-  createContext,
-  recordError,
-  runCheck,
-} from "./validation.ts";
+import { createContext, recordError } from "./validation.ts";
 
 function isIntent(value: unknown): value is Intent {
   if (!value || typeof value !== "object") return false;
   const item = value as Record<string, unknown>;
-  if (item.protocol !== "cfordo/1") return false;
-  if (
-    ![item.goalId, item.attemptId].every(
-      (id) => Number.isSafeInteger(id) && Number(id) > 0,
-    )
-  )
-    return false;
-  if (
-    ![item.stepName, item.instanceId].every(
-      (name) => typeof name === "string" && name.length > 0,
-    )
-  )
-    return false;
-  if (item.feedback !== undefined) {
-    if (!item.feedback || typeof item.feedback !== "object") return false;
-    const feedback = item.feedback as Record<string, unknown>;
-    if (
-      typeof feedback.source !== "string" ||
-      !["validate", "evaluate"].includes(feedback.source) ||
-      typeof feedback.reason !== "string"
-    )
-      return false;
-  }
-  if (item.resume !== undefined) {
-    if (!item.resume || typeof item.resume !== "object") return false;
-    const resume = item.resume as Record<string, unknown>;
-    if (
-      typeof resume.phase !== "string" ||
-      !["validate", "evaluate"].includes(resume.phase) ||
-      !Number.isSafeInteger(resume.attemptId) ||
-      Number(resume.attemptId) <= 0
-    )
-      return false;
-  }
-  return true;
-}
-
-function workerResultSaved(
-  attempt: Attempt,
-  definition: WorkerDefinition | undefined,
-): boolean {
-  if (attempt.error || attempt.validation?.ok === false) return true;
   return (
-    !!definition &&
-    attempt.output !== undefined &&
-    (!definition.validate || attempt.validation?.ok === true)
+    item.protocol === "cfordo/2" &&
+    Number.isSafeInteger(item.attemptId) &&
+    Number(item.attemptId) > 0
   );
 }
-
-function matches(attempt: Attempt, intent: Intent): boolean {
-  return (
-    attempt.goalId === intent.goalId && attempt.stepName === intent.stepName
-  );
+function terminal(attempt: Attempt): boolean {
+  return attempt.status === "completed" || attempt.status === "failed";
 }
-
 export async function notifyCompletion(
-  intent: Intent,
-  options: OrdoBindings,
+  id: number,
+  bindings: OrdoBindings,
 ): Promise<void> {
-  const attempt = await getAttempt(options.db, intent.attemptId);
-  const goal = await getGoal(options.db, intent.goalId);
-  if (
-    attempt.status === "completed" ||
-    attempt.status === "failed" ||
-    goal.status === "completed" ||
-    goal.status === "failed"
-  )
-    return;
-  const binding = options.workflow;
+  const attempt = await getAttempt(bindings.db, id);
+  if (!terminal(attempt))
+    throw new Error(`Action ${id} has no terminal D1 record`);
+  const goal = await getGoal(bindings.db, attempt.goalId);
+  if (goal.status !== "running") return;
+  if (!goal.instanceId) throw new Error("Action has no Workflow instance");
   try {
-    const instance = await binding.get(intent.instanceId);
-    await instance.sendEvent({
-      type: completionType(intent.attemptId),
-      payload: { attemptId: intent.attemptId },
-    });
+    const instance = await bindings.workflow.get(goal.instanceId);
+    await instance.sendEvent({ type: completionType(id), payload: null });
   } catch (error) {
-    // A duplicate notification may race with the Engine completing the Goal.
-    const current = await getAttempt(options.db, intent.attemptId);
-    const currentGoal = await getGoal(options.db, intent.goalId);
-    if (
-      current.status === "completed" ||
-      current.status === "failed" ||
-      currentGoal.status === "completed" ||
-      currentGoal.status === "failed"
-    )
-      return;
-    throw error;
+    if (getGoalStatus(await getGoal(bindings.db, goal.id)) === "running")
+      throw error;
   }
 }
 
-async function runWorker(
-  definition: WorkerDefinition,
-  intent: Intent,
-  options: OrdoBindings,
-): Promise<AttemptPatch> {
-  const goal = await getGoal(options.db, intent.goalId);
-  const details = {
-    goalId: intent.goalId,
-    stepName: intent.stepName,
-    attemptId: intent.attemptId,
-    ...(intent.feedback ? { feedback: intent.feedback } : {}),
-  };
-  const result: AttemptPatch = { error: null, validation: null };
-  let value: unknown;
-  if (intent.resume) {
-    const previous = await getAttempt(options.db, intent.resume.attemptId);
-    if (
-      !matches(previous, intent) ||
-      previous.id >= intent.attemptId ||
-      previous.error?.source !== intent.resume.phase
-    ) {
-      return {
-        error: recordError("Invalid retry source", "configuration", {
-          fatal: true,
-        }),
-      };
-    }
-    if (intent.resume.phase !== "validate") {
-      return {
-        error: recordError(
-          "Evaluation retries belong to the Engine",
-          "configuration",
-          { fatal: true },
-        ),
-      };
-    }
-    value = previous.output;
-    result.output = previous.output;
-    assertJson(value, "Saved retry input");
-  } else {
-    try {
-      value = await definition.run(createContext(details, goal.input));
-      assertJson(value, "Worker return value");
-    } catch (error) {
-      return { error: recordError(error, "run") };
-    }
+function feedbackFrom(history: Attempt[]): OrdoContext["feedback"] {
+  for (const attempt of history.slice().reverse()) {
+    if (attempt.status !== "completed") continue;
+    if (attempt.action === "validate" && attempt.validation?.ok === false)
+      return { source: "validate", reason: attempt.validation.reason };
+    if (attempt.action === "evaluate" && attempt.evaluation?.ok === false)
+      return { source: "evaluate", reason: attempt.evaluation.reason };
   }
-
-  result.output = value;
-  if (definition.validate) {
-    await updateAttempt(options.db, intent.attemptId, { status: "validating" });
-    try {
-      result.validation = await runCheck(
-        definition.validate,
-        createContext(details, goal.input, result.output),
-      );
-    } catch (error) {
-      result.error = recordError(error, "validate");
-    }
-  }
-  return result;
 }
 
 export function createWorker(
-  definition: WorkerDefinition | undefined,
+  definition: RegisteredStep | undefined,
 ): WorkerExecutor {
-  return async (intent, options) => {
-    const attempt = await getAttempt(options.db, intent.attemptId);
-    if (!matches(attempt, intent))
-      throw new Error("Intent does not match its Attempt");
-    if (attempt.status === "completed" || attempt.status === "failed") return;
-
-    // A lost sendEvent response or Queue redelivery must not re-run business code.
-    if (workerResultSaved(attempt, definition)) {
-      await notifyCompletion(intent, options);
+  return async (intent, bindings) => {
+    let attempt = await getAttempt(bindings.db, intent.attemptId);
+    if (!attempt.action)
+      throw new Error(
+        "Legacy combined executions cannot use the action consumer",
+      );
+    if (terminal(attempt)) {
+      await notifyCompletion(attempt.id, bindings);
       return;
     }
-    if (getGoalStatus(await getGoal(options.db, intent.goalId)) !== "running")
-      return;
-    if (!(await claimAttempt(options.db, intent.attemptId))) {
-      const current = await getAttempt(options.db, intent.attemptId);
-      if (workerResultSaved(current, definition))
-        await notifyCompletion(intent, options);
-      return;
+    const goal = await getGoal(bindings.db, attempt.goalId);
+    if (getGoalStatus(goal) !== "running") return;
+    if (!(await claimAttempt(bindings.db, attempt.id))) {
+      attempt = await getAttempt(bindings.db, attempt.id);
+      if (terminal(attempt)) {
+        await notifyCompletion(attempt.id, bindings);
+        return;
+      }
+      if (getGoalStatus(await getGoal(bindings.db, goal.id)) !== "running")
+        return;
+      // Do not guess whether an in-flight execution died, and do not rerun it.
+      throw new Error(
+        `Action ${attempt.id} is already running; automatic recovery is not supported`,
+      );
     }
-
-    const result = definition
-      ? await runWorker(definition, intent, options)
-      : {
-          error: recordError(
-            `Step not registered: ${intent.stepName}`,
-            "configuration",
-            { fatal: true },
-          ),
-        };
-    // Storage errors escape to Queue retry. No completion is sent on failed save.
-    const saved = await updateAttempt(options.db, intent.attemptId, result);
-    if (saved) await notifyCompletion(intent, options);
+    const action = attempt.action;
+    const handler = (action ? definition?.[action] : undefined) as
+      ((ctx: OrdoContext) => Promise<void>) | undefined;
+    try {
+      if (!handler || definition?.name !== attempt.stepName)
+        throw new Error(
+          `Handler not registered: ${attempt.stepName}/${action}`,
+        );
+      let result;
+      if (action !== "run") {
+        if (attempt.sourceRunId === null)
+          throw new Error("Check has no source run");
+        const source = await getAttempt(bindings.db, attempt.sourceRunId);
+        if (
+          source.goalId !== attempt.goalId ||
+          source.stepName !== attempt.stepName ||
+          source.action !== "run" ||
+          source.status !== "completed" ||
+          source.output === undefined
+        )
+          throw new Error("Check source is not a completed run of this step");
+        result = source.output;
+      }
+      const history = (
+        await listAttempts(bindings.db, goal.id, attempt.stepName)
+      ).filter((a) => a.id < attempt.id);
+      const ctx = createContext(
+        bindings.db,
+        attempt,
+        goal.input,
+        result,
+        feedbackFrom(history),
+      );
+      // Only completion/exception is observed. Business return values are ignored.
+      await handler(ctx);
+      await finishAttempt(bindings.db, attempt.id);
+    } catch (error) {
+      await failAttempt(
+        bindings.db,
+        attempt.id,
+        recordError(error, action ?? "configuration", {
+          ...(!handler ? { fatal: true } : {}),
+        }),
+      );
+    }
+    await notifyCompletion(attempt.id, bindings);
   };
 }
 
@@ -223,31 +143,27 @@ export function createQueueConsumer<Env>(
   workers: ReadonlyMap<string, WorkerExecutor>,
   resolveOptions: () => Promise<OrdoBindings>,
 ): QueueHandler<Env> {
-  const qu = new Qu<Env>();
   const unknownWorker = createWorker(undefined);
-  const receive = async (batch: QueueBatch): Promise<void> => {
-    // Each invocation keeps its own bindings; concurrent events cannot replace
-    // another invocation's database or notification destination.
-    const options = await resolveOptions();
-    await initOrdo(options.db);
+  return async (batch: QueueBatch): Promise<void> => {
+    const bindings = await resolveOptions();
+    await initOrdo(bindings.db);
     await Promise.all(
       batch.messages.map(async (message) => {
         try {
-          if (!isIntent(message.body)) throw new Error("Invalid cfordo Intent");
-          const execute = workers.get(message.body.stepName) ?? unknownWorker;
-          await execute(message.body, options);
+          if (!isIntent(message.body))
+            throw new Error("Invalid cfordo action message");
+          const attempt = await getAttempt(bindings.db, message.body.attemptId);
+          const execute = workers.get(attempt.stepName) ?? unknownWorker;
+          await execute(message.body, bindings);
           message.ack();
-        } catch {
+        } catch (error) {
+          console.error("Ordo Queue processing failed", {
+            messageId: message.id,
+            message: error instanceof Error ? error.message : String(error),
+          });
           message.retry();
         }
       }),
     );
-  };
-  // cfqu forwards the original Cloudflare values. The cast keeps its ambient
-  // Cloudflare type dependency out of cfordo's public declarations.
-  const dispatch = qu.queue as unknown as QueueHandler<Env>;
-  return (batch, env, ctx) => {
-    qu.on(batch.queue, receive);
-    return dispatch(batch, env, ctx);
   };
 }

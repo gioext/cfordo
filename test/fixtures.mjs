@@ -1,5 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { initOrdo, Ordo } from "./.build/core.mjs";
+import { getGoal } from "../src/db/store.ts";
+import { getGoalStatus } from "./.build/core.mjs";
 
 export class TestDatabase {
   constructor() {
@@ -119,8 +121,12 @@ export class TestWorkflowStep {
   async waitForEvent(name, options) {
     this.calls.push({ name, options });
     if (!this.cache.has(name)) {
-      await this.beforeWait?.(name, options);
-      this.cache.set(name, this.hub.wait(options.type));
+      this.cache.set(
+        name,
+        Promise.resolve()
+          .then(() => this.beforeWait?.(name, options))
+          .then(() => this.hub.wait(options.type)),
+      );
     }
     return structuredClone(await this.cache.get(name));
   }
@@ -166,9 +172,13 @@ export async function harness(t, options = {}) {
   const pending = new Set();
   const destinations = [];
   const workflowBinding = {
+    create: async () => ({ id: "workflow-1" }),
     get: async (id) => {
       destinations.push(id);
-      return { sendEvent: (event) => hub.send(event) };
+      return {
+        sendEvent: (event) => hub.send(event),
+        status: async () => ({ status: "running" }),
+      };
     },
   };
   const context = {
@@ -180,7 +190,7 @@ export async function harness(t, options = {}) {
   const runtime = {
     db,
     step,
-    event: { instanceId: "workflow-1" },
+    event: { workflowName: "test-workflow", instanceId: "workflow-1" },
     expiresIn: options.expiresIn,
     queue: {
       async send(body) {
@@ -198,8 +208,9 @@ export async function harness(t, options = {}) {
     bindings: { db: db, queue: runtime.queue, workflow: workflowBinding },
     expiresIn: options.expiresIn,
   };
-  const consumer = new Ordo();
-  consumer.binding(configuration.bindings);
+  const env = { DB: db, QUEUE: runtime.queue, WORKFLOW: workflowBinding };
+  const consumer = new Ordo(env);
+  let goalId;
   consumer.configure({ expiresIn: configuration.expiresIn });
   function schedule(body, number) {
     const message = queueMessage(body, number);
@@ -231,54 +242,64 @@ export async function harness(t, options = {}) {
     destinations,
     workflow: consumer,
     configuration,
-    newDefinition() {
-      const definition = new Ordo();
-      definition.binding(configuration.bindings);
+    env,
+    newDefinition(owner) {
+      const definition = new Ordo(env, owner);
       definition.configure({ expiresIn: configuration.expiresIn });
       return definition;
     },
-    run(input) {
-      return consumer.run({ ...runtime.event, payload: input }, step);
+    async run(input) {
+      goalId = await consumer.start(input);
+      return consumer.run({ ...runtime.event, payload: { goalId } }, step);
     },
-    replay(definition, input) {
-      return definition.run({ ...runtime.event, payload: input }, step);
+    async replay(definition, input) {
+      goalId ??= await definition.start(input);
+      return definition.run({ ...runtime.event, payload: { goalId } }, step);
+    },
+    async status() {
+      return getGoalStatus(await getGoal(db, goalId));
+    },
+    goal() {
+      return getGoal(db, goalId);
     },
     intent(attemptId, extra = {}) {
-      const row = db.rows("cfordo_attempts", "id = ?", attemptId)[0];
-      return {
-        protocol: "cfordo/1",
-        goalId: row.goal_id,
-        stepName: row.step_name,
-        attemptId,
-        instanceId: "workflow-1",
-        ...extra,
-      };
+      return { protocol: "cfordo/2", attemptId, ...extra };
     },
   };
 }
 
 export function seedAttempt(db, options = {}) {
   const now = Date.now();
-  const goalId = Number(
-    db.sqlite
-      .prepare(
-        "INSERT INTO cfordo_goals (input_json,status,created_at,expires_at) VALUES (?, 'running', ?, ?)",
-      )
-      .run(
-        JSON.stringify(options.input ?? {}),
-        now,
-        options.expiresAt ?? now + 86400000,
-      ).lastInsertRowid,
-  );
+  const goalId =
+    options.goalId ??
+    Number(
+      db.sqlite
+        .prepare(
+          `INSERT INTO cfordo_goals
+    (workflow_name,instance_id,input_json,status,created_at,expires_at) VALUES (?, ?, ?, 'running', ?, ?)`,
+        )
+        .run(
+          "test-workflow",
+          options.instanceId ?? crypto.randomUUID(),
+          JSON.stringify(options.input ?? {}),
+          now,
+          options.expiresAt ?? now + 86400000,
+        ).lastInsertRowid,
+    );
+  const stepName = options.stepName ?? "extract";
   const attemptId = Number(
     db.sqlite
       .prepare(
-        "INSERT INTO cfordo_attempts (goal_id,step_name,worker_name,created_at) VALUES (?, ?, ?, ?)",
+        `INSERT INTO cfordo_attempts
+    (goal_id,step_name,worker_name,action,source_run_id,predecessor_id,created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         goalId,
-        options.stepName ?? "extract",
-        options.workerName ?? "extract",
+        stepName,
+        stepName,
+        options.action ?? "run",
+        options.sourceRunId ?? null,
+        options.predecessorId ?? null,
         now,
       ).lastInsertRowid,
   );

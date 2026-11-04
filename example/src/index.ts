@@ -1,59 +1,47 @@
-import { Ordo, type OrdoContext } from "cfordo";
+import { Ordo } from "cfordo";
 
-export class ExampleWorkflow extends Ordo<Env> {
+type Params = { value: number };
+
+export class ExampleWorkflow extends Ordo<Env, Params> {
   async setup() {
-    this.binding({
-      db: this.env.DB,
-      queue: this.env.QUEUE,
-      workflow: this.env.WORKFLOW,
+    this.configure({ expiresIn: 24 * 60 * 60 * 1000 });
+    await this.parallel(async () => {
+      this.step<{ value: number }>({
+        name: "double",
+        run: async function (ctx) {
+          const { params } = ctx.input();
+          await ctx.complete({ value: params.value * 2 });
+        },
+        validate: async function (ctx) {
+          const { result } = ctx.input();
+          if (Number.isFinite(result.value)) await ctx.ok();
+          else await ctx.ng("結果が有限の数値ではありません");
+        },
+        evaluate: async function (ctx) {
+          const { params, result } = ctx.input();
+          if (result.value === params.value * 2) await ctx.ok();
+          else await ctx.ng("入力を2倍した結果と一致しません");
+        },
+      });
+      this.step<{ value: number }>({
+        name: "square",
+        run: async function (ctx) {
+          const { params } = ctx.input();
+          await ctx.complete({ value: params.value ** 2 });
+        },
+        validate: async function (ctx) {
+          const { result } = ctx.input();
+          if (Number.isFinite(result.value)) await ctx.ok();
+          else await ctx.ng("結果が有限の数値ではありません");
+        },
+        evaluate: async function (ctx) {
+          const { params, result } = ctx.input();
+          if (result.value === params.value ** 2) await ctx.ok();
+          else await ctx.ng("入力を2乗した結果と一致しません");
+        },
+      });
     });
-    this.configure({
-      expiresIn: 24 * 60 * 60 * 1000,
-    });
-    await this.parallel(this.registerParallel);
-  }
-
-  async registerParallel() {
-    this.step({
-      name: "double",
-      run: this.double,
-      validate: this.validate,
-      evaluate: this.evaluateDouble,
-    });
-    this.step({
-      name: "square",
-      run: this.square,
-      validate: this.validate,
-      evaluate: this.evaluateSquare,
-    });
-  }
-
-  async double(ctx: OrdoContext) {
-    const params = ctx.params<{ value: number }>();
-    return { value: params.value * 2 };
-  }
-
-  async square(ctx: OrdoContext) {
-    return { value: ctx.params().value ** 2 };
-  }
-
-  async validate(ctx: OrdoContext) {
-    if (!Number.isFinite(ctx.result().value))
-      return ctx.ng("結果が有限の数値ではありません");
-    return ctx.ok();
-  }
-
-  async evaluateDouble(ctx: OrdoContext) {
-    if (ctx.result().value !== ctx.params().value * 2)
-      return ctx.ng("入力を2倍した結果と一致しません");
-    return ctx.ok();
-  }
-
-  async evaluateSquare(ctx: OrdoContext) {
-    if (ctx.result().value !== ctx.params().value ** 2)
-      return ctx.ng("入力を2乗した結果と一致しません");
-    return ctx.ok();
   }
 }
 
-export default ExampleWorkflow;
+export default ExampleWorkflow.worker();
