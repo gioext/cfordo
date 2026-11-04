@@ -2,23 +2,48 @@
 
 ## 目的
 
-Ordoを継承したクラスから、2つの工程をQueue経由で並列実行するexample。
+独立した工程がD1へ結果を保存し、後続工程がSQLでその結果を取得するexample。
+`double`・`square`を並列実行し、その完了後に`sum`を実行する。
 
 ## 仕様
 
 - 入力は`{ "value": 7 }`のような数値を持つJSON。
 - `double`は入力を2倍、`square`は入力を2乗する。
-- 2つのStepを`parallel()`で実行し、両方の完了後にGoalが完了する。
-- 各工程の`run`・`validate`・`evaluate`は独立したQueue処理として実行され、正常時は計6件の実行記録がD1に保存される。
+- `double`と`square`を`parallel()`で実行する。両方の検証・評価が成功してから、`sum`が同じGoalの両結果をSQLで読み取って足す。
+- `sum`の検証・評価まで成功するとGoalが完了する。先行工程が失敗した場合、`sum`は開始しない。
+- 各工程の`run`・`validate`・`evaluate`は独立したQueue処理として実行され、正常時は計9件の実行記録がD1に保存される。
+- `validate`は保存結果が有限の数値かを確認する。`evaluate`はそのGoalの入力やD1の保存結果から期待値を求めて比較する。
 - サービスBinding経由で専用Workerの`POST /_ordo/goals`へJSONを送ると、HTTP 202と数値の`{ "goalId": 1 }`を返す。
 - `GET /_ordo/goals`は入力・状態・工程別の結果を全件返す。`GET /_ordo/goals/:goalId`は各工程の`executions`も返す。
 - `executions`はrun・validate・evaluateの処理履歴。再配信では増えず、業務上の再試行で増える。
 - 公開URLは無効。サービスBindingから呼ぶ内部HTTP APIはOrdoに組み込まれたHonoを使用する。外部AI APIは使用しない。
 - `setup()`に設定・工程を定義し、名前付きのWorkflowクラスと`ExampleWorkflow.worker()`を公開する。
 - Binding名は`DB`・`QUEUE`・`WORKFLOW`に固定する。
-- 入力は`ctx.input()`の`params`と`result`から取得する。
+- 起動入力は各処理で`ctx.input().params`から取得する。検証・評価の`ctx.input().result`は同じ工程のrunのD1保存結果。
+- `sum`は`this.env.DB`のSQLで先行工程の保存結果を取得する。入力に追加のレコードIDは不要。既存のGoal IDで対象の実行を指定する。
 - `run`は`await ctx.complete(data)`、検証・評価は`await ctx.ok()`・`await ctx.ng(reason)`で保存する。関数は値を返さない。
 - 起動入力の`Params`と各工程の結果型を定義し、保存・読み取りの型を共有する。
+
+### 工程間のデータ取得
+
+```mermaid
+flowchart LR
+  input[(D1: Goal入力 value=7)] --> double[double]
+  input --> square[square]
+  double --> d[(D1: doubleの結果 14)]
+  square --> s[(D1: squareの結果 49)]
+  d -->|SQLで取得| sum[sum]
+  s -->|SQLで取得| sum
+  sum --> result[(D1: sumの結果 63)]
+```
+
+`parallel()`の終了は先行工程の完了待ちであり、結果の受け渡しではない。
+`sum`のrunは、同じGoalのdouble・squareの最新runが保存した結果をSQLで読み取り、足した値を保存する。
+各工程のvalidate・evaluateも別のQueue処理として動き、同じ工程のrunの保存結果を`ctx.input().result`から取得する。
+doubleとsquareのevaluateは起動入力から期待値を計算し、sumのevaluateは先行工程の結果をD1から再取得して照合する。入力値を固定せず、それぞれのGoalのデータで判定する。
+工程間で戻り値やメモリ上の計算結果を共有せず、D1の保存結果を参照する。
+
+SQLを含む利用例は[src/index.ts](src/index.ts)にある。この例ではOrdoの結果保存先を参照し、新しい業務テーブルや事前登録用のIDは追加しない。
 
 | リソース | 名前                    |
 | -------- | ----------------------- |
@@ -58,8 +83,9 @@ DBの初期化とマイグレーションは、Ordoが実行開始時に自動�
 
 - 入力7・11・23のGoalを並行して起動し、異なるGoal IDを返すこと。
 - 全件一覧と1件取得で、入力・状態・工程別結果が一致すること。
-- 正常時は各工程のrun・validate・evaluateが成功し、Goalごとに計6件の`executions`があること。
-- 入力`{ "value": 1e308 }`では非有限の結果を保存できず、例外の再試行上限でGoalが失敗し、理由と履歴を取得できること。
+- 正常時は各工程のrun・validate・evaluateが成功し、Goalごとに計9件の`executions`があること。
+- sumが先行2工程の完了後に開始し、そのGoalのD1保存結果の和を返すこと。
+- 入力`{ "value": 1e308 }`では非有限の結果を保存できず、例外の再試行上限でGoalが失敗し、理由と履歴を取得できること。sumの`executions`は0件であること。
 - 不正JSON・不正IDは400、存在しないGoal IDは404を返すこと。
 - 公開URLからはアクセスできず、サービスBinding経由で利用できること。
 
@@ -79,7 +105,8 @@ pnpm --filter @cfordo/example request GET /_ordo/goals/1
 引数はHTTPメソッド、パス、任意のJSON本文。HTTPステータスと本文を表示し、HTTPエラー時は終了コード1を返す。
 通信セッションはリクエスト終了時に閉じる。`request`で起動したGoalの完了は、詳細取得で確認する。
 
-検証で作成したGoalは本番DBに保存される。入力ごとの期待結果はdoubleが2倍、squareが2乗。
+検証で作成したGoalは本番DBに保存される。入力ごとの期待結果はdoubleが2倍、squareが2乗、sumがその和。
+7なら14・49・63、11なら22・121・143、23なら46・529・575になる。
 
 ## デプロイ方法
 
@@ -111,9 +138,9 @@ const list = await env.ORDO.fetch("https://ordo/_ordo/goals");
 const detail = await env.ORDO.fetch(`https://ordo/_ordo/goals/${goalId}`);
 ```
 
-入力7なら`double`の`output`は`{ "value": 14 }`、`square`は`{ "value": 49 }`になる。
-Goalと両工程の`status`が`completed`であり、検証・評価が成功していることを確認する。
-一覧は全件をGoal ID降順で返す。詳細の各工程には正常時3件ずつ、計6件の`executions`を含む。
+入力7なら`double`の`output`は`{ "value": 14 }`、`square`は`{ "value": 49 }`、`sum`は`{ "value": 63 }`になる。
+Goalと3工程の`status`が`completed`であり、検証・評価が成功していることを確認する。
+一覧は全件をGoal ID降順で返す。詳細の各工程には正常時3件ずつ、計9件の`executions`を含む。
 
 日時はUnix時刻のミリ秒。不正なJSON・IDは400、不存在は404、起動確認・状態照会の障害は503を返す。
 起動確認が503でも`goalId`が返った場合は、そのGoalを照会する。再POSTは新しいGoalを作る。

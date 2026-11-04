@@ -12,6 +12,19 @@ Changing steps during execution, AI-generated workflow changes, and deployment o
 
 ## Specification
 
+### Independent steps and D1
+
+Each step executes independently, reads the data it needs from D1, and saves its results to D1.
+Execution order does not pass one step's return value into another. Do not rely on shared class fields, variables, or closures to carry data between steps.
+Even sequential steps exchange data through persisted records. Independent execution and data access still allow a step to wait for earlier steps to finish.
+
+- Startup input is saved with the Goal in D1 and is available to each action as `ctx.input().params`.
+- `ctx.complete(data)` saves that execution's result to D1. In validation and evaluation, `ctx.input().result` is the saved result of the referenced run in the same step.
+- A step that needs another step's result queries D1 using the Goal ID and step name or another explicit key. Other steps' results are not automatically placed in `ctx.input().result`.
+
+The [runnable example](example/src/index.ts) starts double and square in parallel for `{ "value": 7 }`, then runs sum after both finish.
+Double saves 14 and square saves 49 to D1. Sum uses SQL to read both results for the same Goal and saves 63. Validation checks that the result is a finite number. Evaluation derives the expectation from that Goal's input or saved D1 results. Sum's evaluation independently reads both D1 results again.
+
 ### Usage
 
 ```ts
@@ -167,12 +180,13 @@ Duplicate names, empty parallel groups, and nested parallel groups are not allow
 
 ### Input and persistence
 
-Every action reads its input through `ctx.input()`.
+Before each action starts, Ordo reads the saved Goal input and referenced run result from D1. `ctx.input()` returns those values for that action.
+An action that needs another step's result or application-table data queries it directly through `this.env.DB`.
 
-| Field    | Description                                                                                                 |
-| -------- | ----------------------------------------------------------------------------------------------------------- |
-| `params` | Startup parameters saved in D1, typed as `Params`                                                           |
-| `result` | The business result saved by the referenced `run`, typed as `Result` in checks and `undefined` during `run` |
+| Field    | Description                                                                                                                        |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `params` | Startup parameters saved in D1, typed as `Params`                                                                                  |
+| `result` | The saved result of the referenced `run` in the same step, not the preceding step; `Result` in checks and `undefined` during `run` |
 
 Check retries refer to the same successful run, rather than switching to an unrelated latest result.
 Modifying retrieved values does not change the saved input or business result.
