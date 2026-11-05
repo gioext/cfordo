@@ -1,7 +1,6 @@
 import { assertJson } from "./core/validation.ts";
 import { Hono } from "hono";
 import { GoalNotFoundError } from "./db/store.ts";
-import { GoalReadError, GoalStartError } from "./core/goal.ts";
 import type { GoalDetail, GoalSummary, OrdoEnv } from "./types.ts";
 
 interface Goals {
@@ -19,19 +18,6 @@ export function createApi<Env extends OrdoEnv>(
       return c.json(
         { error: { code: "GoalNotFound", message: error.message } },
         404,
-      );
-    if (error instanceof GoalStartError)
-      return c.json(
-        {
-          goalId: error.goalId,
-          error: { code: "StartUnconfirmed", message: error.message },
-        },
-        503,
-      );
-    if (error instanceof GoalReadError)
-      return c.json(
-        { error: { code: "StatusUnavailable", message: error.message } },
-        503,
       );
     console.error("Ordo API failed", error);
     return c.json(

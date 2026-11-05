@@ -10,26 +10,35 @@ export interface OrdoContext<
   Params = any,
   Result = any,
   Phase extends Action = Action,
+  Env extends OrdoEnv = OrdoEnv,
 > {
+  readonly env: Env;
   input(): { params: Params; result: Phase extends "run" ? undefined : Result };
+  result<T = any>(stepName: string): Promise<T>;
   complete: Phase extends "run" ? (value: Result) => Promise<void> : never;
   ok: Phase extends "run" ? never : () => Promise<void>;
   ng: Phase extends "run" ? never : (reason: string) => Promise<void>;
   readonly goalId: number;
   readonly stepName: string;
   readonly attemptId: number;
-  readonly feedback?: { source: CheckSource; reason: string };
+  readonly feedback: ImprovementFeedback;
 }
 
-export type CheckFunction<Params = any, Result = any> = (
-  ctx: OrdoContext<Params, Result, CheckSource>,
-) => Promise<void>;
+export type CheckFunction<
+  Params = any,
+  Result = any,
+  Env extends OrdoEnv = OrdoEnv,
+> = (ctx: OrdoContext<Params, Result, CheckSource, Env>) => Promise<void>;
 
-export interface StepDefinition<Params = any, Result = any> {
+export interface StepDefinition<
+  Params = any,
+  Result = any,
+  Env extends OrdoEnv = OrdoEnv,
+> {
   name: string;
-  run(ctx: OrdoContext<Params, Result, "run">): Promise<void>;
-  validate?: CheckFunction<Params, Result>;
-  evaluate?: CheckFunction<Params, Result>;
+  run(ctx: OrdoContext<Params, Result, "run", Env>): Promise<void>;
+  validate?: CheckFunction<Params, Result, Env>;
+  evaluate?: CheckFunction<Params, Result, Env>;
 }
 
 // Only the structural subset used by cfordo is required of Cloudflare bindings.
@@ -54,89 +63,27 @@ export interface DatabaseBinding {
   ): Promise<DatabaseResult<Row>[]>;
 }
 
-export interface QueueBinding {
-  send(message: unknown): Promise<unknown>;
-}
-
-export interface WorkflowStepBinding {
-  do(
-    name: string,
-    config: { retries: { limit: number; delay: number } },
-    callback: () => Promise<void>,
-  ): Promise<void>;
-  waitForEvent(
-    name: string,
-    options: { type: string },
-  ): Promise<{ payload: unknown }>;
-}
-
-export interface GoalParams {
-  goalId: number;
-}
-
 export interface OrdoEnv {
   DB: D1Database;
   QUEUE: Queue;
-  WORKFLOW: Workflow<GoalParams>;
 }
 
-export interface CoreEnv {
-  DB: DatabaseBinding;
-  QUEUE: QueueBinding;
-  WORKFLOW: WorkflowBinding;
-}
-
-export interface WorkflowBinding {
-  create(options: { params: GoalParams }): Promise<{ id: string }>;
-  get(id: string): Promise<{
-    sendEvent(event: { type: string; payload: unknown }): Promise<void>;
-    status(): Promise<{
-      status: InstanceStatus["status"];
-      error?: { message: string; name: string };
-    }>;
-  }>;
-}
-
-export interface QueueMessage {
-  readonly id: string;
-  readonly body: unknown;
-  readonly attempts: number;
-  readonly timestamp: Date;
-  ack(): void;
-  retry(options?: { delaySeconds?: number }): void;
-}
-
-export interface QueueBatch {
-  readonly queue: string;
-  readonly messages: readonly QueueMessage[];
-  ackAll(): void;
-  retryAll(options?: { delaySeconds?: number }): void;
-}
-
-export interface QueueContext {
-  waitUntil(promise: Promise<unknown>): void;
-}
-
-export type QueueHandler<Env = unknown> = (
-  batch: QueueBatch,
-  env: Env,
-  ctx: QueueContext,
-) => Promise<void>;
-
-export interface OrdoBindings {
-  db: DatabaseBinding;
-  queue: QueueBinding;
-  workflow: WorkflowBinding;
+export interface ImprovementFeedback {
+  readonly iteration: number;
+  readonly source: CheckSource | null;
+  readonly reason: string | null;
 }
 
 export interface OrdoOptions {
+  /** Name of the native dead-letter queue consumed by this Worker. */
+  deadLetterQueue: string;
   /** Goal lifetime in milliseconds; defaults to 24 hours. */
   expiresIn?: number;
 }
 
-export interface OrdoRegistration<Params = any> {
+export interface OrdoRegistration<Params = any, Env extends OrdoEnv = OrdoEnv> {
   configure(options: OrdoOptions): void;
-  step<Result = any>(definition: StepDefinition<Params, Result>): void;
+  step<Result = any>(definition: StepDefinition<Params, Result, Env>): void;
   parallel(callback: () => Promise<void>): Promise<void>;
 }
 
@@ -148,25 +95,48 @@ export interface Goal {
   id: number;
   input: JsonValue;
   error: AttemptError | null;
-  workflowName: string | null;
-  instanceId: string | null;
   status: GoalStatus;
   createdAt: number;
   expiresAt: number;
   finishedAt: number | null;
 }
 
-export type ErrorSource = "run" | CheckSource | "dispatch" | "configuration";
+export type ErrorSource =
+  "run" | CheckSource | "dispatch" | "configuration" | "queue";
 export interface AttemptError {
   source: ErrorSource;
   name: string;
   message: string;
-  fatal?: boolean;
   stack?: string;
+}
+
+export interface Iteration {
+  id: number;
+  goalId: number;
+  stepName: string;
+  iteration: number;
+  status:
+    | "ready"
+    | "sending"
+    | "queued"
+    | "running"
+    | "retrying"
+    | "completed"
+    | "failed";
+  dispatchToken: string | null;
+  messageId: string | null;
+  delivery: number;
+  token: string | null;
+  error: AttemptError | null;
+  createdAt: number;
+  finishedAt: number | null;
 }
 
 export interface Attempt {
   id: number;
+  iterationId: number | null;
+  iteration: number | null;
+  delivery: number | null;
   goalId: number;
   stepName: string;
   action: Action | null;
@@ -181,37 +151,17 @@ export interface Attempt {
   finishedAt: number | null;
 }
 
-export type RegisteredStep = StepDefinition;
-
-export type Playbook = readonly (readonly RegisteredStep[])[];
+export type RegisteredStep<Env extends OrdoEnv = any> = StepDefinition<
+  any,
+  any,
+  Env
+>;
+export type Playbook<Env extends OrdoEnv = OrdoEnv> =
+  readonly (readonly RegisteredStep<Env>[])[];
 export interface Intent {
-  protocol: "cfordo/2";
-  attemptId: number;
-}
-
-export interface WorkflowIdentity {
-  workflowName: string;
-  instanceId: string;
-}
-
-export interface Runtime {
-  db: DatabaseBinding;
-  queue: QueueBinding;
-  step: WorkflowStepBinding;
-  event: WorkflowIdentity;
-}
-
-export type WorkerExecutor = (
-  intent: Intent,
-  bindings: OrdoBindings,
-) => Promise<void>;
-
-// Application failures are recorded and counted by cfordo, not multiplied by
-// WorkflowStep's default retry policy. No delay is used with a zero retry limit.
-export const NO_WORKFLOW_RETRIES = { retries: { limit: 0, delay: 0 } } as const;
-
-export function completionType(attemptId: number): string {
-  return `ordo-completed-${attemptId}`;
+  protocol: "cfordo/3";
+  iterationId: number;
+  dispatchToken: string;
 }
 
 /** HTTP responses. Execution history is present only on the detail endpoint. */
@@ -221,6 +171,8 @@ export interface ErrorInfo {
 }
 export interface ExecutionDetail {
   attemptId: number;
+  iteration?: number;
+  delivery?: number;
   action: Action;
   sourceRunId: number | null;
   status: AttemptStatus;

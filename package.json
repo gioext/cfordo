@@ -1,7 +1,7 @@
 {
   "name": "cfordo",
   "version": "0.1.0",
-  "description": "Playbook-driven workflows for Cloudflare Workflows, Queues and D1.",
+  "description": "Playbook-driven jobs for Cloudflare Cron Triggers, Queues and D1.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

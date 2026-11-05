@@ -2,26 +2,13 @@
 
 ## 目的
 
-Cloudflare Workflows・Queues・D1で、事前に定義した工程を実行するTypeScriptフレームワーク。
-業務処理・検証・評価は独立したQueue処理として実行し、結果・判定・進行状態をD1で管理する。
-1 Workerにつき1つのOrdoクラスを定義し、専用のD1・Queue・Workflowを使用する。Honoを組み込んだ内部HTTP APIをサービスBinding経由で呼び出し、起動・一覧・結果取得を行う。公開URLは使用しない。
+Cloudflare Cron Triggers・Queues・D1で、事前に定義した工程を実行するTypeScriptフレームワーク。
+1回のQueue処理でrun・validate・evaluateを順に実行する。入力・結果・判定・改善周回・進行状態はD1へ保存する。
+専用Workerに1つのOrdoを配置し、専用のD1とQueueを使用する。HTTP APIはサービスBinding経由で利用し、公開URLは使用しない。
 
 実行中の工程変更、AIによる工程の追加・変更、Cloudflare以外へのデプロイは対象外とする。
 
 ## 仕様
-
-### 工程の独立性とD1の役割
-
-各工程は独立して実行され、必要なデータをD1から取得し、結果をD1へ保存する。
-実行順序を指定しても、前工程の戻り値が次の工程へ渡されることはない。工程間のクラスフィールド・変数・クロージャの共有に依存しない。
-順番に実行する工程でも、データは保存済みのレコードを通して参照する。独立しているのは実行とデータ取得であり、先行工程の完了を待つ順序指定はできる。
-
-- 起動入力はGoalのデータとしてD1に保存され、各actionで`ctx.input().params`から参照できる。
-- `ctx.complete(data)`はその工程の実行結果をD1へ保存する。検証・評価の`ctx.input().result`は、同じ工程の対象runの保存結果である。
-- 他工程の結果が必要な工程は、Goal IDと工程名などで対象を指定し、D1から取得する。他工程の結果が`ctx.input().result`へ自動的に入ることはない。
-
-[実行できるexample](example/src/index.ts)では、入力`{ "value": 7 }`に対してdoubleとsquareを並列実行し、両方の完了後にsumを実行する。
-doubleは14、squareは49をD1へ保存する。sumはSQLで同じGoalの両結果を読み、63を保存する。validateは結果が有限の数値かを確認し、evaluateはそのGoalの入力やD1の保存結果から期待値を求めて比較する。sumの評価でもD1から両結果を読み直す。
 
 ### 利用例
 
@@ -29,212 +16,154 @@ doubleは14、squareは49をD1へ保存する。sumはSQLで同じGoalの両結�
 import { Ordo } from "cfordo";
 
 type Params = { value: number };
+const ordo = new Ordo<Env, Params>();
+ordo.configure({ deadLetterQueue: "example-ordo-queue-dlq" });
 
-export class MyWorkflow extends Ordo<Env, Params> {
-  async setup() {
-    this.configure({ expiresIn: 24 * 60 * 60 * 1000 });
-    this.step<{ value: number }>({
-      name: "calculate",
-      run: async function (ctx) {
-        const { params } = ctx.input();
-        await ctx.complete({ value: params.value * 2 });
-      },
-      validate: async function (ctx) {
-        const { result } = ctx.input();
-        if (Number.isFinite(result.value)) await ctx.ok();
-        else await ctx.ng("結果が有限の数値ではありません");
-      },
-      evaluate: async function (ctx) {
-        const { params, result } = ctx.input();
-        if (result.value === params.value * 2) await ctx.ok();
-        else await ctx.ng("入力を2倍した結果と一致しません");
-      },
-    });
-  }
-}
+ordo.step<{ value: number }>({
+  name: "double",
+  run: async (ctx) => ctx.complete({ value: ctx.input().params.value * 2 }),
+  validate: async (ctx) =>
+    Number.isFinite(ctx.input().result.value) ? ctx.ok() : ctx.ng("非有限"),
+  evaluate: async (ctx) =>
+    ctx.input().result.value === ctx.input().params.value * 2
+      ? ctx.ok()
+      : ctx.ng("2倍と不一致"),
+});
 
-export default MyWorkflow.worker();
+export default ordo;
 ```
 
-`Env`にはWranglerが生成するBinding型を使う。Workflowの名前付きexportをWranglerの`class_name`に指定する。上例では`MyWorkflow`。
-`MyWorkflow.worker()`がサービスBinding用のHTTPとQueueの入口を提供する。利用側でHonoや独自の起動ハンドラーを用意する必要はない。
+`Env`にはWranglerが生成したBinding型を使用する。継承、`setup()`、`.worker()`は不要。
+`export default ordo`でHTTP・Queue・Cronの入口を提供する。利用側でHonoや起動用のHTTPハンドラーを定義する必要はない。
 
-### サービスBinding
+### 起動と進行
 
-Ordo側のWrangler設定は`workers_dev: false`、`preview_urls: false`、`routes: []`とし、公開ルート・カスタムドメインを設定しない。
-呼び出し元Workerは次のサービスBindingを持つ。`service`にはデプロイしたOrdo Workerの名前を指定する。
+Goalの起動時には入力をD1に保存し、HTTP 202と数値のGoal IDを返す。
+起動リクエストは処理完了を待たない。各POSTは新しいGoalを作る。
+毎分のCronで未完了Goalの進行を確認する。処理対象がない回は何も実行しない。
+同じ改善周回のrun・validate・evaluateの間にはCron待ちを挟まない。次の改善周回や後続工程への移行は次のCronを待つ。
+Queue処理から次の処理を起動したり、完了通知を送ったりする必要はない。
 
-```json
-{ "services": [{ "binding": "ORDO", "service": "example-ordo" }] }
-```
+### 工程と並列実行
 
-呼び出し元の`Env`には`ORDO: Fetcher`を定義する。
+`ordo.step<Result>()`へ以下の定義を渡す。
+
+| キー       | 必須 | 用途                                                               |
+| ---------- | ---- | ------------------------------------------------------------------ |
+| `name`     | 必須 | 一意な工程名                                                       |
+| `run`      | 必須 | 業務処理。`ctx.complete(data)`で結果を保存する                     |
+| `validate` | 任意 | 業務ルールの検証。`ctx.ok()`または`ctx.ng(reason)`で判定を保存する |
+| `evaluate` | 任意 | 妥当性の評価。`ctx.ok()`または`ctx.ng(reason)`で判定を保存する     |
+
+すべて非同期関数とし、保存処理はawaitするかそのPromiseを返す。業務データをreturnしても保存されない。
+1回のQueue処理を改善1周とし、run → validate → evaluateを同じctxオブジェクトで実行する。未指定の判定は省略し、validateがNGならevaluateも省略する。
+工程は登録順に進み、次の工程へ進むには先行工程の検証・評価まで成功する必要がある。
+
+`ordo.parallel()`内で登録した工程は並列に進む。登録自体をawaitすることと、業務処理の完了待ちは別である。
 
 ```ts
-const response = await env.ORDO.fetch("https://ordo/_ordo/goals", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ value: 7 }),
+await ordo.parallel(async () => {
+  ordo.step<{ value: number }>({
+    name: "double",
+    run: async (ctx) => ctx.complete({ value: ctx.input().params.value * 2 }),
+  });
+  ordo.step<{ value: number }>({
+    name: "square",
+    run: async (ctx) => ctx.complete({ value: ctx.input().params.value ** 2 }),
+  });
 });
-const { goalId } = await response.json<{ goalId: number }>();
-const detail = await env.ORDO.fetch(`https://ordo/_ordo/goals/${goalId}`);
-const list = await env.ORDO.fetch("https://ordo/_ordo/goals");
+
+ordo.step<{ value: number }>({
+  name: "sum",
+  run: async (ctx) => {
+    const [double, square] = await Promise.all([
+      ctx.result<{ value: number }>("double"),
+      ctx.result<{ value: number }>("square"),
+    ]);
+    await ctx.complete({ value: double.value + square.value });
+  },
+});
 ```
 
-`https://ordo`はRequestを組み立てるためのURLで、公開ドメインやDNSの設定は不要。通信先はサービスBindingが決める。
+並列グループの全工程が成功すると後続へ進む。失敗した工程を再試行しても、成功済みの別工程はやり直さない。
+工程名の重複、空の並列グループ、並列グループの入れ子は許可しない。処理開始後に登録・設定を変更できない。
+全工程の検証・評価を含む[example](example/src/index.ts)を参照する。
+
+### 入力・結果・Bindings
+
+工程間で変数・クロージャ・戻り値を共有せず、必要な値をD1の保存結果から取得する。
+各周回の開始時にGoal入力と前周の改善理由をD1から読み込む。runが保存した今回の結果をvalidate・evaluateが参照する。
+
+| API・値                         | 用途                                                                                  |
+| ------------------------------- | ------------------------------------------------------------------------------------- |
+| `ctx.input().params`            | 同じGoalの起動入力。型は`Params`                                                      |
+| `ctx.input().result`            | 検証・評価の対象runの保存結果。型は`Result`。run自身では`undefined`                   |
+| `await ctx.result<T>(stepName)` | 同じGoalの、指定工程の検証・評価まで成功した結果全体をD1から取得する                  |
+| `ctx.env`                       | 今回の呼び出しのBindings。D1は`ctx.env.DB`、追加Bindingも同様に参照する               |
+| `await ctx.complete(data)`      | runの業務結果を保存する                                                               |
+| `await ctx.ok()`                | 検証・評価の成功判定を保存する。引数なし                                              |
+| `await ctx.ng(reason)`          | 検証・評価の否定判定と空でない理由を保存する                                          |
+| `ctx.goalId`                    | Goal ID                                                                               |
+| `ctx.stepName`                  | 現在の工程名                                                                          |
+| `ctx.attemptId`                 | 現在の段階の実行記録ID。同じctxでも段階が変わると値が変わる                           |
+| `ctx.feedback`                  | `{ iteration, source, reason }`。初回は`{ iteration: 1, source: null, reason: null }` |
+
+`ctx.result()`は未登録・未開始・未完了・失敗した工程にはエラーを返す。runだけの成功では、必要な検証・評価が残っている工程の結果を取得できない。
+Goal IDの指定は不要で、別Goalの結果は混ざらない。工程のテーブル構造を利用側で知る必要もない。
+取得した値の変更はD1へ反映されない。同じ周回内ではfeedbackを変更しない。次の改善周回やQueueのリトライでは、D1から新しいctxを生成する。
+
+Binding名は`DB`（D1）と`QUEUE`（専用Queue）に固定する。`Env`は`OrdoEnv`を満たす必要があり、追加の業務用Bindingsも利用できる。
+`configure()`には、同じWorkerが受信するDLQ名を`deadLetterQueue`として指定する。例外リトライの回数・遅延はWranglerのQueue consumer設定だけで管理する。
+型引数は静的な型指定であり、業務スキーマの実行時検証ではない。未指定の入力・結果型は`any`となる。
+
+### 保存・改善ループ・例外リトライ
+
+入力と業務結果はJSON互換の値に限る。`undefined`、非有限数値、循環参照などは保存できない。結果が不要なrunでは`ctx.complete(null)`を使う。
+各段階は結果・判定を保存して正常終了すると完了する。保存後に例外を投げれば、その段階は失敗として履歴に残る。再実行時も保存操作が必要。
+
+- validateまたはevaluateがNGなら、その周の結果を保存してQueue処理を正常終了する。NGは例外ではない。
+- 次のCronが、NG理由を`ctx.feedback.source`・`reason`へ渡し、`iteration`を1増やして次の周を起動する。
+- 改善上限は初回を含む10周。validate・evaluateのNGに別々の上限は設けない。10周目でOKなら成功し、NGなら品質未達でGoalを失敗にする。
+- 途中の例外はQueueのリトライで同じ周のrunからやり直す。成功済みの段階も実行され得るため、外部への副作用は冪等に扱うこと。
+- Queueのリトライではiterationと前周のfeedbackを変えない。例外回数を改善回数に加算しない。
+- 配送待ち・実行中・Queueのリトライ待ちはCronから再送しない。送信失敗は次のCronで再送し、送信途中の停止は1分の送信確認期限後に再送可能となる。
+- 確定済みの周回の重複配送では処理を実行せず、保存済み結果も変更しない。
+- Queueの再試行上限を超えたメッセージは標準DLQで受け取り、D1へ`QueueRetriesExhausted`として失敗を確定する。Cronで新しいメッセージに置き換えてQueueの上限をリセットしない。
+
+Queueの各再実行で行った段階も履歴に残す。`executions`の`iteration`は改善周回、`delivery`はQueueの配送試行番号で、両者を区別できる。旧形式の履歴ではこれらのフィールドを省略する。
+正常時の履歴は各工程run・validate・evaluateの3件で、example全体では9件。validateがNGの周にはevaluateの履歴を作らない。
+
+期限はGoal受付時に固定し、改善やリトライで延長しない。既定は24時間。`ordo.configure({ deadLetterQueue: "...", expiresIn: ミリ秒 })`で変更できる。
+期限後に新しい処理を開始しない。実行中の業務処理を期限ちょうどに中断する保証はなく、遅れて保存された結果が履歴に残る場合はある。
 
 ### Goal API
 
-| メソッド・パス             | 入力                   | 応答                                          |
-| -------------------------- | ---------------------- | --------------------------------------------- |
-| `POST /_ordo/goals`        | 業務入力のJSONそのもの | `202 { "goalId": 1 }`と取得先の`Location`     |
-| `GET /_ordo/goals`         | なし                   | 全件をGoal ID降順の配列で返す。ページングなし |
-| `GET /_ordo/goals/:goalId` | 正の整数のGoal ID      | 1件の状態・結果・実行履歴                     |
+| メソッド・パス             | 入力           | 応答                                      |
+| -------------------------- | -------------- | ----------------------------------------- |
+| `POST /_ordo/goals`        | 業務入力のJSON | `202 { "goalId": 1 }`と取得先の`Location` |
+| `GET /_ordo/goals`         | なし           | 全件をGoal ID降順で返す。ページングなし   |
+| `GET /_ordo/goals/:goalId` | 正の整数ID     | 1件の状態・結果・実行履歴                 |
 
-起動時に数値のGoal IDを採番する。Workflowの実行IDとは別のIDで、以後の照会にはGoal IDを使う。
-POSTはWorkflowの完了を待たない。再POSTは新しいGoalを作る。複数起動したGoalを定期照会して結果を集約できる。
+共通フィールドは`goalId`・`input`・`status`・`createdAt`・`expiresAt`・`finishedAt`・`error`・`results`。
+状態は`ready`・`running`・`completed`・`failed`・`expired`。日時はUnix時刻のミリ秒。未確定の終了日時は`null`。
+結果は`stepName`・`status`・`action`・`output`・`validation`・`evaluation`・`error`・`createdAt`・`finishedAt`を持ち、未開始の工程も含む。
+`action`は現在または次の処理。完了した工程では`null`。出力と判定は同じrunに対応し、未保存・未実施は`null`。
+途中・失敗時の出力も表示されるため、結果の採用時には工程の`status`が`completed`であることを確認する。
 
-一覧・詳細の共通フィールドは`goalId`、`input`、`status`、`createdAt`、`expiresAt`、`finishedAt`、`error`、`results`。
-`status`は`ready`・`running`・`completed`・`failed`・`expired`。日時はUnix時刻のミリ秒で、完了日時が確定していなければ`finishedAt`は`null`。
-`results`は工程ごとの配列で、`stepName`・`status`・`action`・`output`・`validation`・`evaluation`・`error`・`createdAt`・`finishedAt`を返す。
-未開始の工程も含む。`action`は実行中または次に実行する処理で、完了時は`null`。工程の状態にも`expired`を使用する。
-`output`と検証・評価の判定は同じrunに対応する。再試行前の判定を新しい出力に混ぜない。未保存の結果・未実施の判定は`null`。
-途中や失敗した処理の出力も確認できるため、集約への採用は工程の`status`が`completed`になってから行う。
+詳細だけは工程ごとに`executions`を含み、実行記録ID昇順で返す。一覧には含めない。
+各記録は`attemptId`・`action`・`sourceRunId`・`status`・`output`・`verdict`・`error`・`createdAt`・`finishedAt`を持つ。
+`sourceRunId`は検証・評価の対象runのIDで、run自身では`null`。
+判定は`{ "ok": true }`または`{ "ok": false, "reason": "..." }`。
+エラーは`{ "code": "...", "message": "..." }`で、なければ`null`。
 
-詳細だけは各工程に`executions`を含む。1件がQueue経由の処理1回分で、実行ID昇順。
-フィールドは`attemptId`・`action`・`sourceRunId`・`status`・`output`・`verdict`・`error`・`createdAt`・`finishedAt`。
-`action`は`run`・`validate`・`evaluate`。`sourceRunId`は検証・評価の対象runのIDで、run自身では`null`。
-`verdict`は`{ "ok": true }`または`{ "ok": false, "reason": "..." }`。判定がなければ`null`。
-同じQueueメッセージの再配信では履歴を増やさず、業務上の再試行で新しい履歴が増える。
-
-エラーは`{ "code": "...", "message": "..." }`、なければ`null`。
-不正なJSON・IDは`400`、不存在は`404`、予期しない障害は`500`、Workflowの起動確認・状態照会の障害は`503`。
-HTTPエラーは`{ "error": { "code": "...", "message": "..." } }`。Goal保存後の起動確認に失敗した場合は`goalId`も返す。
-この場合、起動済みの可能性があるためGoalを照会する。未開始のままでも受付時の期限で期限切れになる。
-業務上の失敗・期限切れでも、照会に成功すればHTTP `200`。基盤の異常終了も照会に反映し、照会障害を業務失敗とは扱わない。
-
-### 初期化・接続・設定
-
-`setup()`は必須の非同期メソッド。未実装は型チェックで検出され、`override`は不要。
-クラスのフィールド初期化後、各インスタンスで処理開始前に一度だけ実行する。初期化の同時要求でも重複実行しない。
-`setup()`では設定・工程を登録し、業務上の副作用は各actionへ記述する。
-
-Binding名は`DB`（D1）、`QUEUE`（専用Queue）、`WORKFLOW`（同じOrdoクラスのWorkflow）に固定する。
-`Env`は公開型`OrdoEnv`を満たす必要がある。業務処理用の追加Bindingは利用できる。
-
-`this.configure()`は任意。
-
-| キー        | 内容                                             |
-| ----------- | ------------------------------------------------ |
-| `expiresIn` | Goalの有効期間。正の整数のミリ秒。省略時は24時間 |
-
-登録時にはDB操作やQueue送信を行わない。正常に初期化が完了してから開始する。実行開始後の設定・工程変更は禁止する。
-
-### 工程と型
-
-`this.step<Result>()`に、1工程の定義を渡す。
-
-| キー       | 必須 | 内容                                                                       |
-| ---------- | ---- | -------------------------------------------------------------------------- |
-| `name`     | 必須 | 工程名                                                                     |
-| `run`      | 必須 | 業務処理。結果を`await ctx.complete(data)`で保存する                       |
-| `validate` | 任意 | 業務ルールの検証。判定を`await ctx.ok()`／`await ctx.ng(reason)`で保存する |
-| `evaluate` | 任意 | 妥当性の評価。判定を`await ctx.ok()`／`await ctx.ng(reason)`で保存する     |
-
-全actionは非同期関数で、データをreturnしない。関数が返した値は保存・受け渡し・進行判断に使用しない。
-指定されたactionを`run`、`validate`、`evaluate`の順に、別々のQueue処理で実行する。未指定の判定は省略する。
-各actionの完了後、D1の記録から次のactionを決める。業務結果・判定をWorkflow stepの戻り値や完了通知のpayloadで受け渡さない。
-
-`Params`はHTTPで受け取る業務入力と各actionの入力の型。WorkflowはOrdoのAPIから起動する。
-`Result`は工程ごとの業務結果型で、`ctx.complete()`と検証・評価の入力に反映する。型指定は任意で、省略時は`any`。
-これらは静的な型指定であり、実行時の業務スキーマ検証は行わない。ZodやStandard Schemaは要求しない。
-
-登録したメソッドと`parallel()`のコールバックは、Ordoインスタンスに結び付けて実行する。利用者の`.bind(this)`は不要。
-同じメソッドを複数工程で再利用できる。Workerの別途登録や、実行する関数の文字列指定は不要。
-
-### 並列実行
-
-通常の工程は登録順に実行する。`this.parallel()`内に登録した工程は並列に進める。
-
-```ts
-await this.parallel(async () => {
-  this.step<{ value: number }>({
-    name: "double",
-    run: async function (ctx) {
-      await ctx.complete({ value: ctx.input().params.value * 2 });
-    },
-  });
-  this.step<{ value: number }>({
-    name: "square",
-    run: async function (ctx) {
-      await ctx.complete({ value: ctx.input().params.value ** 2 });
-    },
-  });
-});
-```
-
-各工程の必要なactionが全て成功してから次の工程群へ進む。成功済みの並列工程は、他の工程の再実行で繰り返さない。
-工程名の重複、空の並列グループ、並列グループのネストは禁止する。非同期登録は`setup()`で完了を待つ。
-
-### 入力と保存
-
-各actionの開始時に、OrdoがD1から起動入力と対象runの結果を読み込む。`ctx.input()`はそのaction用に読み込まれた値を返す。
-他工程の結果や業務テーブルのデータが必要な場合は、工程自身が`this.env.DB`でSQLを実行して取得する。
-
-| フィールド | 内容                                                                                                            |
-| ---------- | --------------------------------------------------------------------------------------------------------------- |
-| `params`   | 起動時にD1へ保存したパラメータ。`Params`型                                                                      |
-| `result`   | 同じ工程の対象`run`がD1へ保存した結果。前工程の結果ではない。検証・評価では`Result`型、`run`実行中は`undefined` |
-
-検証・評価の再試行では、同じ成功済み`run`の結果を参照する。別の実行の「最新結果」へ切り替わることはない。
-取得した値を変更しても、保存済みの入力・結果は変更されない。
-
-| API・値                    | 内容                                                     |
-| -------------------------- | -------------------------------------------------------- |
-| `await ctx.complete(data)` | 業務結果を保存。`run`専用                                |
-| `await ctx.ok()`           | OK判定を保存。検証・評価専用。引数なし                   |
-| `await ctx.ng(reason)`     | NG判定と理由を保存。検証・評価専用。空白だけの理由は不可 |
-| `ctx.goalId`               | GoalのID                                                 |
-| `ctx.stepName`             | 工程名                                                   |
-| `ctx.attemptId`            | 今回のaction実行を識別するID                             |
-| `ctx.feedback`             | 前回のNG判定の`{ source, reason }`。初回は未設定         |
-
-保存APIの戻り値は全て`Promise<void>`で、必ず完了を待つ。同じ実行中のレコードへの上書きは許可する。
-保存APIを呼んだだけでは次へ進まず、**必要な結果がD1に保存され、関数が正常終了した後に処理完了を確定・通知する**。
-保存後に関数が例外終了した場合、その実行は失敗として扱う。完了確定後の記録は変更しない。
-
-入力・業務結果にはJSONとして保存可能な値を使う。結果が不要な処理は`await ctx.complete(null)`で明示する。
-`undefined`、循環参照、非有限数などは保存できない。保存を呼ばずに終了したactionも、共通の例外処理で失敗を記録する。
-判定NGは例外ではない。判定を保存して関数が正常終了したactionは完了し、D1のNG判定から業務工程の再実行を決める。
-
-### 再試行・再開・終了
-
-- 例外時は、失敗したactionだけを新しい実行記録で再試行する。
-- 検証・評価NG時は、理由を引き継いで新しい`run`から再実行する。
-- 同じGoal・工程全体で例外3回、検証NG3回、評価NG10回を上限とする。初回を含む固定値で、再実行しても回数をリセットしない。
-- 結果保存済みでも正常終了していないactionを、成功扱いしない。
-- 完了・失敗の記録が確定した後のQueue再配信は、actionを繰り返さず再通知する。
-- 実行中の所在が不明なactionを推測で再実行しない。途中クラッシュからの厳密な自動復旧は保証せず、基盤の失敗・期限切れとして扱う。
-
-例外は共通処理でD1へ記録する。実行ID・工程・action・時刻と、エラーの種類・内容・取得できるスタックを確認できる。
-D1への失敗記録も保存できない場合や通知に失敗した場合は、Queue基盤の再配信に任せる。独自の自動復旧機構は設けない。
-
-1つのWorkflowインスタンスを1つのGoalへ対応付ける。再開時はD1から同じGoalと進行状態を取得する。
-同じインスタンスの再起動でも既存の入力・完了状態を維持する。新たな業務実行には、起動APIで新しいGoalを作る。
-Workflow stepの戻り値やメモリ上の変数を、再開用の状態として利用しない。
-
-業務上の状態はGoal APIで確認する。Workflowの最終出力に`completed`・`failed`・`expired`は返さない。
-Workflow基盤の正常終了と、業務上のGoalの成功は区別する。Goalが業務上失敗しても、制御を正常に終えたWorkflowは基盤上では正常終了になる。
-
-期限はHTTP受付時のGoal作成で確定し、再実行で延長しない。期限切れは保存済みの期限と現在時刻から判定し、そのためだけのDB更新は行わない。
-期限切れを確認した後は新たなactionを開始しない。すでに進行中の処理を時刻到達時に強制停止する保証はなく、遅れて保存された結果は履歴として保持する。
-
-管理用D1は処理開始時に自動で初期化・更新する。明示的な初期化には`initOrdo(env.DB)`を使用できる。
+不正なJSON・IDはHTTP 400、存在しないGoalは404、予期しない基盤エラーは500。
+業務上の失敗・期限切れでも取得できればHTTP 200で返し、結果の`status`と`error`で区別する。
+起動リクエストの応答を受信できなくても、Goalが保存されている可能性はある。再POSTは別Goalになる。
 
 ## 開発環境
 
-Node.js・pnpmは`mise.toml`のバージョンを使用する。型チェックは`tsrs`を使用する。動作検証はWranglerでデプロイした本番のexampleで行う。
-利用側のBinding型・ランタイム型は`wrangler types`で生成する。
+`mise.toml`のNode.js・pnpmを使用する。型チェックは`tsrs`、デプロイはWranglerを使用する。
+利用側のBindingsとランタイム型は`wrangler types`で生成する。
 
 ## 開発方法
 
@@ -245,16 +174,50 @@ pnpm format
 pnpm check
 ```
 
-`pnpm format`は設定ファイルや依存を追加せず、`npx`経由でPrettierのデフォルト設定を使う。`.gitignore`に従い、生成型とロックファイルも除外する。
-`pnpm check`はライブラリの型チェック・ビルドと、exampleの型チェックを行う。ローカルの確認だけで動作検証完了とはしない。
-動作検証は[exampleの手順](example/README.md)に従い、本番のexampleへサービスBinding経由で接続して行う。
-`pnpm build`はESMのJavaScript・型定義・ソースマップを`dist`へ生成する。
+`pnpm check`はライブラリの型チェック・ビルドとexampleの型チェックを行う。
+ローカルの確認は型チェック・ビルドに限定し、動作は[本番exampleの手順](example/README.md)に従って検証する。
+`pnpm build`はESM・型宣言・ソースマップを`dist`へ出力する。
 
 ## デプロイ方法
 
-npm公開権限を持つアカウントで`pnpm run deploy`を実行する。公開前に`pnpm check`と、本番のexampleでの動作検証を完了する。
-専用WorkerをWranglerでデプロイし、固定名のD1・QueueのProducer／Consumer・Workflow Bindingを設定する。
-公開URLを無効にし、呼び出し元WorkerのサービスBindingから利用する。exampleの実環境IDはGit管理外のローカル設定へ記入する。
+ライブラリは、本番exampleの検証完了後、npmへの公開権限を持つアカウントで`pnpm run deploy`を実行して公開する。
+利用側WorkerにはD1・Queue producer/consumer・例外リトライ上限到達時のDLQと毎分のCronを設定する。DLQも同じWorkerが受信し、名前を`configure({ deadLetterQueue })`へ指定する。
 
-切り替え前に旧WorkflowとQueue処理の終了を確認する。action別の記録を持つ現行DBはそのまま使用できる。
-それ以前の一体型実行のDBはリセットが必要。スキーマは初期マイグレーション1つで作成する。
+```json
+{
+  "queues": {
+    "consumers": [
+      {
+        "queue": "example-ordo-queue",
+        "max_retries": 3,
+        "dead_letter_queue": "example-ordo-queue-dlq"
+      },
+      { "queue": "example-ordo-queue-dlq" }
+    ]
+  },
+  "triggers": { "crons": ["* * * * *"] }
+}
+```
+
+Cronは常設する。設定の追加・変更・削除がCloudflare全体に反映されるまで時間がかかる場合がある。
+公開URLは`workers_dev: false`・`preview_urls: false`・`routes: []`で無効にする。
+呼び出し元にはサービスBindingを設定する。
+
+```json
+{ "services": [{ "binding": "ORDO", "service": "example-ordo" }] }
+```
+
+```ts
+const response = await env.ORDO.fetch("https://ordo/_ordo/goals", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ value: 7 }),
+});
+const { goalId } = await response.json<{ goalId: number }>();
+const detail = await env.ORDO.fetch(`https://ordo/_ordo/goals/${goalId}`);
+```
+
+URLのホスト名はRequestを組み立てるためのもので、通信先はBindingが決める。公開ドメインやDNS設定は不要。
+DBは自動で初期化・マイグレーションする。明示的に初期化する場合は`initOrdo(env.DB)`を使用できる。
+旧構成から切り替える前に、旧WorkflowとQueue処理が終了していることを確認する。
+既存のaction別DBと実行履歴は保持したまま移行でき、DBのリセットは不要。

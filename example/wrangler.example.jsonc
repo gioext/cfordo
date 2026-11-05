@@ -15,13 +15,21 @@
   ],
   "queues": {
     "producers": [{ "binding": "QUEUE", "queue": "example-ordo-queue" }],
-    "consumers": [{ "queue": "example-ordo-queue", "max_batch_timeout": 0 }],
+    "consumers": [
+      {
+        "queue": "example-ordo-queue",
+        "max_batch_timeout": 0,
+        "max_retries": 3,
+        "retry_delay": 10,
+        "dead_letter_queue": "example-ordo-queue-dlq",
+      },
+      {
+        "queue": "example-ordo-queue-dlq",
+        "max_batch_timeout": 0,
+        "max_retries": 3,
+        "retry_delay": 10,
+      },
+    ],
   },
-  "workflows": [
-    {
-      "binding": "WORKFLOW",
-      "name": "example-ordo-workflow",
-      "class_name": "ExampleWorkflow",
-    },
-  ],
+  "triggers": { "crons": ["* * * * *"] },
 }

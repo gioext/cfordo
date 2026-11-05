@@ -1,169 +1,195 @@
 import { initOrdo } from "../db/init.ts";
 import {
-  claimAttempt,
-  failAttempt,
+  beginAttempt,
+  claimIteration,
+  ExecutionStopped,
+  exhaustIteration,
   finishAttempt,
+  finishIteration,
   getAttempt,
   getGoal,
+  getIteration,
   listAttempts,
+  listIterations,
+  recordIterationError,
 } from "../db/store.ts";
-import {
-  completionType,
-  type Attempt,
-  type Intent,
-  type OrdoBindings,
-  type OrdoContext,
-  type QueueBatch,
-  type QueueHandler,
-  type RegisteredStep,
-  type WorkerExecutor,
+import type {
+  Action,
+  Intent,
+  JsonValue,
+  OrdoContext,
+  OrdoEnv,
+  RegisteredStep,
 } from "../types.ts";
 import { getGoalStatus } from "./goal.ts";
-import { createContext, recordError } from "./validation.ts";
+import { createContext } from "./context.ts";
+import { recordError } from "./validation.ts";
+import { improvement } from "./progress.ts";
 
 function isIntent(value: unknown): value is Intent {
   if (!value || typeof value !== "object") return false;
   const item = value as Record<string, unknown>;
   return (
-    item.protocol === "cfordo/2" &&
-    Number.isSafeInteger(item.attemptId) &&
-    Number(item.attemptId) > 0
+    item.protocol === "cfordo/3" &&
+    Number.isSafeInteger(item.iterationId) &&
+    Number(item.iterationId) > 0 &&
+    typeof item.dispatchToken === "string"
   );
 }
-function terminal(attempt: Attempt): boolean {
-  return attempt.status === "completed" || attempt.status === "failed";
-}
-export async function notifyCompletion(
-  id: number,
-  bindings: OrdoBindings,
-): Promise<void> {
-  const attempt = await getAttempt(bindings.db, id);
-  if (!terminal(attempt))
-    throw new Error(`Action ${id} has no terminal D1 record`);
-  const goal = await getGoal(bindings.db, attempt.goalId);
-  if (goal.status !== "running") return;
-  if (!goal.instanceId) throw new Error("Action has no Workflow instance");
-  try {
-    const instance = await bindings.workflow.get(goal.instanceId);
-    await instance.sendEvent({ type: completionType(id), payload: null });
-  } catch (error) {
-    if (getGoalStatus(await getGoal(bindings.db, goal.id)) === "running")
-      throw error;
-  }
-}
 
-function feedbackFrom(history: Attempt[]): OrdoContext["feedback"] {
-  for (const attempt of history.slice().reverse()) {
-    if (attempt.status !== "completed") continue;
-    if (attempt.action === "validate" && attempt.validation?.ok === false)
-      return { source: "validate", reason: attempt.validation.reason };
-    if (attempt.action === "evaluate" && attempt.evaluation?.ok === false)
-      return { source: "evaluate", reason: attempt.evaluation.reason };
-  }
-}
-
-export function createWorker(
-  definition: RegisteredStep | undefined,
-): WorkerExecutor {
-  return async (intent, bindings) => {
-    let attempt = await getAttempt(bindings.db, intent.attemptId);
-    if (!attempt.action)
-      throw new Error(
-        "Legacy combined executions cannot use the action consumer",
-      );
-    if (terminal(attempt)) {
-      await notifyCompletion(attempt.id, bindings);
+async function runIteration<Env extends OrdoEnv>(
+  message: Message<Intent>,
+  env: Env,
+  definitions: ReadonlyMap<string, RegisteredStep<Env>>,
+): Promise<void | false> {
+  let round = await getIteration(env.DB, message.body.iterationId);
+  if (
+    round.status === "completed" ||
+    round.status === "failed" ||
+    round.dispatchToken !== message.body.dispatchToken
+  )
+    return;
+  const goal = await getGoal(env.DB, round.goalId);
+  if (getGoalStatus(goal) !== "running") return;
+  if (round.messageId && round.messageId !== message.id) return;
+  const token = crypto.randomUUID();
+  if (
+    !(await claimIteration(
+      env.DB,
+      round.id,
+      message.id,
+      message.attempts,
+      token,
+    ))
+  ) {
+    round = await getIteration(env.DB, round.id);
+    if (
+      round.status === "completed" ||
+      round.status === "failed" ||
+      round.messageId !== message.id
+    )
       return;
-    }
-    const goal = await getGoal(bindings.db, attempt.goalId);
-    if (getGoalStatus(goal) !== "running") return;
-    if (!(await claimAttempt(bindings.db, attempt.id))) {
-      attempt = await getAttempt(bindings.db, attempt.id);
-      if (terminal(attempt)) {
-        await notifyCompletion(attempt.id, bindings);
-        return;
-      }
-      if (getGoalStatus(await getGoal(bindings.db, goal.id)) !== "running")
-        return;
-      // Do not guess whether an in-flight execution died, and do not rerun it.
-      throw new Error(
-        `Action ${attempt.id} is already running; automatic recovery is not supported`,
-      );
-    }
-    const action = attempt.action;
-    const handler = (action ? definition?.[action] : undefined) as
-      ((ctx: OrdoContext) => Promise<void>) | undefined;
-    try {
-      if (!handler || definition?.name !== attempt.stepName)
-        throw new Error(
-          `Handler not registered: ${attempt.stepName}/${action}`,
-        );
-      let result;
-      if (action !== "run") {
-        if (attempt.sourceRunId === null)
-          throw new Error("Check has no source run");
-        const source = await getAttempt(bindings.db, attempt.sourceRunId);
-        if (
-          source.goalId !== attempt.goalId ||
-          source.stepName !== attempt.stepName ||
-          source.action !== "run" ||
-          source.status !== "completed" ||
-          source.output === undefined
+    // A concurrent duplicate must not acknowledge work that has not finished.
+    message.retry({ delaySeconds: 15 * 60 });
+    return false;
+  }
+  round = await getIteration(env.DB, round.id);
+  let action: Action = "run";
+  try {
+    const definition = definitions.get(round.stepName);
+    if (!definition) throw new Error(`Step not registered: ${round.stepName}`);
+    const rounds = await listIterations(env.DB, goal.id, round.stepName);
+    const history = await listAttempts(env.DB, goal.id, round.stepName);
+    const previous = rounds.find((r) => r.iteration === round.iteration - 1);
+    const feedback = previous
+      ? improvement(
+          history
+            .filter(
+              (a) =>
+                a.iterationId === previous.id &&
+                a.delivery === previous.delivery,
+            )
+            .at(-1),
         )
-          throw new Error("Check source is not a completed run of this step");
-        result = source.output;
+      : null;
+    if (
+      round.iteration > 1 &&
+      (!previous || previous.status !== "completed" || !feedback)
+    )
+      throw new Error(
+        "Improvement iteration has no preceding negative verdict",
+      );
+    const shared = createContext(
+      env,
+      goal.id,
+      round.stepName,
+      goal.input,
+      {
+        iteration: round.iteration,
+        source: feedback?.source ?? null,
+        reason: feedback?.reason ?? null,
+      },
+      token,
+      definitions,
+    );
+    let runId: number | null = null;
+    let previousId: number | null = null;
+    let output: JsonValue | undefined;
+    for (action of ["run", "validate", "evaluate"] as const) {
+      const handler = definition[action] as
+        | ((ctx: OrdoContext<any, any, Action, Env>) => Promise<void>)
+        | undefined;
+      if (!handler) continue;
+      const attempt = await beginAttempt(
+        env.DB,
+        round,
+        token,
+        action,
+        action === "run" ? null : runId,
+        previousId,
+      );
+      shared.enter(attempt, output);
+      await handler(shared.context);
+      if (!shared.hasOutcome())
+        throw new Error("Action ended without saving its result or verdict");
+      await finishAttempt(env.DB, attempt, token);
+      const finished = await getAttempt(env.DB, attempt.id);
+      previousId = attempt.id;
+      if (action === "run") {
+        runId = attempt.id;
+        output = finished.output;
       }
-      const history = (
-        await listAttempts(bindings.db, goal.id, attempt.stepName)
-      ).filter((a) => a.id < attempt.id);
-      const ctx = createContext(
-        bindings.db,
-        attempt,
-        goal.input,
-        result,
-        feedbackFrom(history),
-      );
-      // Only completion/exception is observed. Business return values are ignored.
-      await handler(ctx);
-      await finishAttempt(bindings.db, attempt.id);
-    } catch (error) {
-      await failAttempt(
-        bindings.db,
-        attempt.id,
-        recordError(error, action ?? "configuration", {
-          ...(!handler ? { fatal: true } : {}),
-        }),
-      );
+      if (improvement(finished)) break;
     }
-    await notifyCompletion(attempt.id, bindings);
-  };
+    await finishIteration(env.DB, round.id, token);
+  } catch (error) {
+    if (error instanceof ExecutionStopped) return;
+    await recordIterationError(
+      env.DB,
+      round.id,
+      token,
+      recordError(error, action),
+    );
+    throw error;
+  }
 }
 
-export function createQueueConsumer<Env>(
-  workers: ReadonlyMap<string, WorkerExecutor>,
-  resolveOptions: () => Promise<OrdoBindings>,
-): QueueHandler<Env> {
-  const unknownWorker = createWorker(undefined);
-  return async (batch: QueueBatch): Promise<void> => {
-    const bindings = await resolveOptions();
-    await initOrdo(bindings.db);
-    await Promise.all(
-      batch.messages.map(async (message) => {
-        try {
-          if (!isIntent(message.body))
-            throw new Error("Invalid cfordo action message");
-          const attempt = await getAttempt(bindings.db, message.body.attemptId);
-          const execute = workers.get(attempt.stepName) ?? unknownWorker;
-          await execute(message.body, bindings);
-          message.ack();
-        } catch (error) {
-          console.error("Ordo Queue processing failed", {
-            messageId: message.id,
-            message: error instanceof Error ? error.message : String(error),
-          });
-          message.retry();
+export async function consumeQueue<Env extends OrdoEnv>(
+  batch: MessageBatch<unknown>,
+  env: Env,
+  definitions: ReadonlyMap<string, RegisteredStep<Env>>,
+  deadLetterQueue: string,
+): Promise<void> {
+  await initOrdo(env.DB);
+  const deadLetter = batch.queue === deadLetterQueue;
+  await Promise.all(
+    batch.messages.map(async (message) => {
+      try {
+        if (!isIntent(message.body))
+          throw new Error("Invalid cfordo iteration message");
+        if (deadLetter) {
+          const round = await getIteration(env.DB, message.body.iterationId);
+          if (round.dispatchToken === message.body.dispatchToken)
+            await exhaustIteration(env.DB, round.id);
+        } else {
+          if (
+            (await runIteration(
+              message as Message<Intent>,
+              env,
+              definitions,
+            )) === false
+          )
+            return;
         }
-      }),
-    );
-  };
+        message.ack();
+      } catch (error) {
+        console.error("Ordo Queue processing failed", {
+          messageId: message.id,
+          queue: batch.queue,
+          message: error instanceof Error ? error.message : String(error),
+        });
+        message.retry();
+      }
+    }),
+  );
 }

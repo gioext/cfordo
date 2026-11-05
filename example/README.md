@@ -2,67 +2,63 @@
 
 ## 目的
 
-独立した工程がD1へ結果を保存し、後続工程がSQLでその結果を取得するexample。
-`double`・`square`を並列実行し、その完了後に`sum`を実行する。
+`double`・`square`を並列実行し、その検証・評価が成功した後に`sum`でD1の両結果を取得して合計するexample。
+`new Ordo()`へ工程を登録し、`export default ordo`で専用Workerとして公開する。
 
 ## 仕様
 
 - 入力は`{ "value": 7 }`のような数値を持つJSON。
 - `double`は入力を2倍、`square`は入力を2乗する。
-- `double`と`square`を`parallel()`で実行する。両方の検証・評価が成功してから、`sum`が同じGoalの両結果をSQLで読み取って足す。
-- `sum`の検証・評価まで成功するとGoalが完了する。先行工程が失敗した場合、`sum`は開始しない。
-- 各工程の`run`・`validate`・`evaluate`は独立したQueue処理として実行され、正常時は計9件の実行記録がD1に保存される。
-- `validate`は保存結果が有限の数値かを確認する。`evaluate`はそのGoalの入力やD1の保存結果から期待値を求めて比較する。
-- サービスBinding経由で専用Workerの`POST /_ordo/goals`へJSONを送ると、HTTP 202と数値の`{ "goalId": 1 }`を返す。
-- `GET /_ordo/goals`は入力・状態・工程別の結果を全件返す。`GET /_ordo/goals/:goalId`は各工程の`executions`も返す。
-- `executions`はrun・validate・evaluateの処理履歴。再配信では増えず、業務上の再試行で増える。
-- 公開URLは無効。サービスBindingから呼ぶ内部HTTP APIはOrdoに組み込まれたHonoを使用する。外部AI APIは使用しない。
-- `setup()`に設定・工程を定義し、名前付きのWorkflowクラスと`ExampleWorkflow.worker()`を公開する。
-- Binding名は`DB`・`QUEUE`・`WORKFLOW`に固定する。
-- 起動入力は各処理で`ctx.input().params`から取得する。検証・評価の`ctx.input().result`は同じ工程のrunのD1保存結果。
-- `sum`は`this.env.DB`のSQLで先行工程の保存結果を取得する。入力に追加のレコードIDは不要。既存のGoal IDで対象の実行を指定する。
-- `run`は`await ctx.complete(data)`、検証・評価は`await ctx.ok()`・`await ctx.ng(reason)`で保存する。関数は値を返さない。
-- 起動入力の`Params`と各工程の結果型を定義し、保存・読み取りの型を共有する。
+- 両工程の検証・評価が成功してから、`sum`が`ctx.result<Result>()`で同じGoalの結果をD1から取得して足す。
+- `sum`の検証・評価まで成功するとGoalが完了する。先行工程が失敗した場合、sumは開始しない。
+- validateは保存結果が有限の数値かを確認する。evaluateはGoal入力やD1の保存結果から期待値を求めて比較する。
+- 正常時は各工程にrun・validate・evaluateの3件ずつ、Goalごとに計9件の実行履歴が残る。
+- 起動入力は`ctx.input().params`、検証・評価の対象runの結果は`ctx.input().result`で取得する。
+- `ctx.result()`は検証・評価まで成功した工程の結果全体を返し、未登録・未完了の工程にはエラーを返す。
+- Binding名は`DB`・`QUEUE`に固定する。業務用の直接アクセスには`ctx.env.DB`などを使用できる。
+- 毎分のCronが進行を確認する。Queueは指定処理と結果保存だけを行う。
+- 1回のQueue処理でrun・validate・evaluateを実行し、同じctxを共有する。次の改善周回と後続工程への移行は次のCronを待つ。
+- Cronは配送済み・実行中・Queueのリトライ待ちを再送しない。送信失敗や送信確認の期限切れに限り、送信をやり直す。
+- validate・evaluateのNGは改善ループとして合算し、初回込みで最大10周。NGの次の周へは`ctx.feedback`でiteration・source・reasonを渡す。validateがNGならevaluateを実行しない。
+- 例外はQueueのリトライで同じ周のrunから再実行し、改善回数を増やさない。各配送で実行した段階の履歴は残る。
+- `ctx.feedback`の初回は`{ iteration: 1, source: null, reason: null }`。同じ周では変更しない。
+- Queueのリトライ上限後はDLQで受け取り、Goalを失敗にする。DLQ名は`ordo.configure({ deadLetterQueue: "example-ordo-queue-dlq" })`へ指定する。
+- runは`ctx.complete(data)`、検証・評価は`ctx.ok()`・`ctx.ng(reason)`で保存する。それぞれawaitするかPromiseを返す。
+- 公開URLは無効。内部HTTP APIはサービスBinding経由で利用する。外部AI APIは使用しない。
 
-### 工程間のデータ取得
+全体の利用例は[src/index.ts](src/index.ts)にある。
+工程間で戻り値やメモリ上の結果を共有せず、sumのrunとevaluateはそれぞれD1から先行工程の結果を取得する。
 
-```mermaid
-flowchart LR
-  input[(D1: Goal入力 value=7)] --> double[double]
-  input --> square[square]
-  double --> d[(D1: doubleの結果 14)]
-  square --> s[(D1: squareの結果 49)]
-  d -->|SQLで取得| sum[sum]
-  s -->|SQLで取得| sum
-  sum --> result[(D1: sumの結果 63)]
-```
+| リソース | 名前                 |
+| -------- | -------------------- |
+| Worker   | `example-ordo`       |
+| D1       | `example-ordo-db`    |
+| Queue    | `example-ordo-queue` |
+| Cron     | `* * * * *`（毎分）  |
 
-`parallel()`の終了は先行工程の完了待ちであり、結果の受け渡しではない。
-`sum`のrunは、同じGoalのdouble・squareの最新runが保存した結果をSQLで読み取り、足した値を保存する。
-各工程のvalidate・evaluateも別のQueue処理として動き、同じ工程のrunの保存結果を`ctx.input().result`から取得する。
-doubleとsquareのevaluateは起動入力から期待値を計算し、sumのevaluateは先行工程の結果をD1から再取得して照合する。入力値を固定せず、それぞれのGoalのデータで判定する。
-工程間で戻り値やメモリ上の計算結果を共有せず、D1の保存結果を参照する。
+### Goal API
 
-SQLを含む利用例は[src/index.ts](src/index.ts)にある。この例ではOrdoの結果保存先を参照し、新しい業務テーブルや事前登録用のIDは追加しない。
+| メソッド・パス             | 応答                                                                          |
+| -------------------------- | ----------------------------------------------------------------------------- |
+| `POST /_ordo/goals`        | 入力JSONを保存し、HTTP 202と数値の`{ "goalId": 1 }`を返す                     |
+| `GET /_ordo/goals`         | 全件をGoal ID降順に返す。入力・状態・工程別結果を含み、`executions`は含まない |
+| `GET /_ordo/goals/:goalId` | 指定Goalの状態・工程別結果と、各工程の`executions`を返す                      |
 
-| リソース | 名前                    |
-| -------- | ----------------------- |
-| Worker   | `example-ordo`          |
-| D1       | `example-ordo-db`       |
-| Workflow | `example-ordo-workflow` |
-| Queue    | `example-ordo-queue`    |
+Goal・工程の状態は`ready`・`running`・`completed`・`failed`・`expired`。日時はUnix時刻のミリ秒。
+検証・評価の`sourceRunId`は対応するrunの実行記録IDである。
+不正なJSON・IDはHTTP 400、不存在は404、予期しない基盤エラーは500。
+業務上の失敗や期限切れでも取得できればHTTP 200で返し、`status`と`error`で結果を判断する。
+再POSTは新しいGoalを作る。HTTPの応答を受信できなくてもGoalが保存されている場合はある。
 
 ## 開発環境
 
-リポジトリルートのmise・pnpm設定を使用する。Wranglerはローカル設定で指定したアカウントにアクセスできる認証が必要。
+リポジトリルートのmise・pnpm設定を使用する。Wranglerは対象アカウントへの認証が必要。
+Bindingsの型は公開用設定例から生成した`worker-configuration.d.ts`を使う。設定を変更したら`pnpm --filter @cfordo/example types`で再生成する。
 
-Binding型は公開用設定例からWranglerが生成する`worker-configuration.d.ts`を使用する。設定を変更した場合は`pnpm --filter @cfordo/example types`で再生成する。Workflowは`Ordo<Env>`を継承したクラスで公開する。
-
-D1は`remote: true`としており、開発時も指定したリモートDBへ接続する。
 `wrangler.example.jsonc`は公開用の設定例で、実環境のAccount ID・DB IDを含めない。
-初回に`wrangler.example.jsonc`を`wrangler.jsonc`へコピーし、自分の`account_id`を追加して`database_id`を設定する。
-`wrangler.jsonc`はGit管理外。開発・デプロイではWranglerがこのファイルを標準で読み込む。CIでは同じファイルを非公開設定から用意する。
-実IDを共通設定へ書き戻したり、Gitの`assume-unchanged`や`skip-worktree`を使ったりする必要はない。
+初回に`wrangler.jsonc`へコピーし、自分の`account_id`と`database_id`を指定する。
+`wrangler.jsonc`はGit管理外で、Wranglerが開発・デプロイ時に標準で読む。実IDを公開用設定へ書き戻さない。
+D1には`remote: true`を指定する。
 
 ## 開発方法
 
@@ -76,37 +72,47 @@ cp example/wrangler.example.jsonc example/wrangler.jsonc
 pnpm check
 ```
 
-DBの初期化とマイグレーションは、Ordoが実行開始時に自動で行う。初期化コマンドの実行は不要。
+DBの初期化・マイグレーションは自動で行う。初期化コマンドの実行は不要。
+ローカル確認は`pnpm check`による型チェック・ビルドに限定し、動作は本番へデプロイしたexampleで確認する。
 
-ローカルの確認は`pnpm check`による型チェック・ビルドに限定する。
-動作検証は本番へデプロイしたexampleに対して行い、ローカル実行を代替にしない。サービスBinding経由で以下を確認する。
-
-- 入力7・11・23のGoalを並行して起動し、異なるGoal IDを返すこと。
-- 全件一覧と1件取得で、入力・状態・工程別結果が一致すること。
-- 正常時は各工程のrun・validate・evaluateが成功し、Goalごとに計9件の`executions`があること。
-- sumが先行2工程の完了後に開始し、そのGoalのD1保存結果の和を返すこと。
-- 入力`{ "value": 1e308 }`では非有限の結果を保存できず、例外の再試行上限でGoalが失敗し、理由と履歴を取得できること。sumの`executions`は0件であること。
-- 不正JSON・不正IDは400、存在しないGoal IDは404を返すこと。
-- 公開URLからはアクセスできず、サービスBinding経由で利用できること。
-
-本番を呼び出す設定は`wrangler.caller.jsonc`に置く。`ORDO`はデプロイ済みの`example-ordo`を参照するサービスBindingで、`remote: true`を指定する。
-`request`コマンドは`request.mjs`を実行し、Wranglerの認証済み接続からこのBindingを呼ぶ。Account IDはローカル専用の`wrangler.jsonc`から読み、呼び出し元設定には実IDを保存しない。
-この設定にWorkerの実装は含めず、別のWorkerをデプロイする必要はない。業務処理・Queue・D1は本番のexampleを使用する。
+本番Workerを呼び出す設定は`wrangler.caller.jsonc`に置く。
+`ORDO`はデプロイ済みの`example-ordo`へのサービスBindingで、`remote: true`を指定する。
+`request`コマンドは`request.mjs`を実行し、Wranglerの認証済み接続から呼び出す。
+Account IDはローカル専用の`wrangler.jsonc`から読み込む。対象のOrdoをローカル実行せず、別Workerや公開プロキシもデプロイしない。
+通信セッションは各リクエストの終了時に閉じる。
 
 ```sh
-# 一覧（引数なしでも同じ）
-pnpm --filter @cfordo/example request GET /_ordo/goals
-# 起動
 pnpm --filter @cfordo/example request POST /_ordo/goals '{"value":7}'
-# 返されたgoalIdで詳細取得（以下は1の場合）
+pnpm --filter @cfordo/example request GET /_ordo/goals
 pnpm --filter @cfordo/example request GET /_ordo/goals/1
 ```
 
 引数はHTTPメソッド、パス、任意のJSON本文。HTTPステータスと本文を表示し、HTTPエラー時は終了コード1を返す。
-通信セッションはリクエスト終了時に閉じる。`request`で起動したGoalの完了は、詳細取得で確認する。
+返されたGoal IDで完了まで詳細を確認する。
 
-検証で作成したGoalは本番DBに保存される。入力ごとの期待結果はdoubleが2倍、squareが2乗、sumがその和。
-7なら14・49・63、11なら22・121・143、23なら46・529・575になる。
+### 本番での確認
+
+- 入力7・11・23を並行して起動し、各POSTがHTTP 202と異なる数値のGoal IDを返すこと。
+- 各Goalのdouble・square・sumと、3工程の検証・評価が成功すること。正常時の履歴は各工程3件ずつ、計9件。
+- 検証・評価が対応するrunを参照し、sumは先行2工程の検証・評価が終わってから開始すること。
+- sumのrunとevaluateが、そのGoalのD1保存結果を`ctx.result()`で取得すること。
+- 全件一覧がGoal ID降順で、入力・状態・工程別結果が詳細と一致し、`executions`を含めないこと。
+- 入力`{ "value": 1e308 }`では非有限の結果を保存できず、Queueの例外リトライ上限で失敗すること。理由と履歴を取得でき、sumの実行履歴は0件であること。
+- 不正JSON・不正IDはHTTP 400、不存在のGoal IDは404を返すこと。
+- 公開URLからはAPIを利用できず、サービスBinding経由では利用できること。
+- 実際のCronで進行し、通常の配送待ち・実行中・Queueのリトライ待ちを再送しないこと。
+- 本番exampleで共有ctx、validateのNGによるevaluate省略、両判定のNGからの改善、10周の共通上限、各段階の例外リトライが改善回数を消費しないことを確認する。
+- Queueの例外リトライ上限後にDLQで失敗が確定すること。
+- APIの入力・結果・判定・履歴を本番D1の保存記録と照合すること。
+
+| 入力 | double | square | sum |
+| ---- | ------ | ------ | --- |
+| 7    | 14     | 49     | 63  |
+| 11   | 22     | 121    | 143 |
+| 23   | 46     | 529    | 575 |
+
+検証で作成したGoalは本番DBに残る。既存の履歴は削除せず、DBをリセットしない。
+一時停止したQueue配送や検証用の通信セッションは、検証終了時に元へ戻す。
 
 ## デプロイ方法
 
@@ -114,18 +120,22 @@ pnpm --filter @cfordo/example request GET /_ordo/goals/1
 pnpm --filter @cfordo/example run deploy
 ```
 
-切り替え前に旧WorkflowとQueue処理の終了を確認する。現行のaction別スキーマからの更新ではDBのリセットは不要。
+デプロイでQueue producer/consumer・DLQ consumerと毎分のCronを設定する。DLQは`example-ordo-queue-dlq`で、同じWorkerが受信する。Queueの`max_retries: 3`は初回の後の再試行3回を意味し、改善上限10周とは別である。Cronは常設し、未完了Goalがなければ何も進めない。
+Cron設定の反映には最大15分かかる場合がある。設定反映と実際の起動を確認してから検証する。
+旧構成からの移行前には旧Workflow・Queue処理の終了を確認する。既存のaction別DBと履歴はそのまま移行できる。
+`workers_dev: false`・`preview_urls: false`・`routes: []`を維持する。
 
-Workerのデプロイ時にWorkflowとQueue Consumerを設定する。`workers.dev`・プレビューURL・公開ルートは無効にする。
-ローカルの実IDを使うWrangler操作には`pnpm --filter @cfordo/example exec wrangler <command>`を使う。
+本番D1などへのWrangler操作は、ローカル設定を使う以下の形で行う。
 
-呼び出し元WorkerのWrangler設定に、次のサービスBindingを追加する。
+```sh
+pnpm --filter @cfordo/example exec wrangler <command>
+```
+
+呼び出し元WorkerにサービスBindingを設定する。
 
 ```json
 { "services": [{ "binding": "ORDO", "service": "example-ordo" }] }
 ```
-
-呼び出し元から起動・取得する。`ORDO`の型は`Fetcher`。URLのホスト名は公開先ではなく、通信先はBindingが決める。
 
 ```ts
 const response = await env.ORDO.fetch("https://ordo/_ordo/goals", {
@@ -134,14 +144,7 @@ const response = await env.ORDO.fetch("https://ordo/_ordo/goals", {
   body: JSON.stringify({ value: 7 }),
 });
 const { goalId } = await response.json<{ goalId: number }>();
-const list = await env.ORDO.fetch("https://ordo/_ordo/goals");
 const detail = await env.ORDO.fetch(`https://ordo/_ordo/goals/${goalId}`);
 ```
 
-入力7なら`double`の`output`は`{ "value": 14 }`、`square`は`{ "value": 49 }`、`sum`は`{ "value": 63 }`になる。
-Goalと3工程の`status`が`completed`であり、検証・評価が成功していることを確認する。
-一覧は全件をGoal ID降順で返す。詳細の各工程には正常時3件ずつ、計9件の`executions`を含む。
-
-日時はUnix時刻のミリ秒。不正なJSON・IDは400、不存在は404、起動確認・状態照会の障害は503を返す。
-起動確認が503でも`goalId`が返った場合は、そのGoalを照会する。再POSTは新しいGoalを作る。
-業務上の失敗・期限切れでも取得に成功すれば200であり、JSONの`status`と`error`を確認する。
+`ORDO`の型は`Fetcher`。URLのホスト名は公開先ではなく、通信先はBindingで決まる。
