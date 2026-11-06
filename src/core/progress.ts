@@ -3,6 +3,7 @@ import type {
   Attempt,
   AttemptError,
   Iteration,
+  IterationResult,
   RegisteredStep,
   CheckSource,
 } from "../types.ts";
@@ -36,19 +37,37 @@ function followingAction(
   return null;
 }
 
+/** Select one execution without making scheduling or Goal-termination decisions. */
+export function executionResult(
+  history: readonly Attempt[],
+  round: Iteration | undefined,
+  results: readonly IterationResult[],
+) {
+  // Results are ordered by their INSERT IDs, allocated only at final persistence.
+  const result = round
+    ? results.find((r) => r.iterationId === round.id)
+    : undefined;
+  const candidates = round
+    ? history.filter((a) => a.iterationId === round.id)
+    : history;
+  const last = result
+    ? candidates.find((a) => a.id === result.attemptId)
+    : candidates.at(-1);
+  const runId = last?.action === "run" ? last.id : last?.sourceRunId;
+  const execution = candidates.filter(
+    (a) => a.id === runId || (runId != null && a.sourceRunId === runId),
+  );
+  return { result, last, execution };
+}
+
 export function stepProgress(
   history: readonly Attempt[],
   rounds: readonly Iteration[],
+  results: readonly IterationResult[],
   definition: RegisteredStep | undefined,
 ) {
   const round = rounds.at(-1);
-  const last = round
-    ? history
-        .filter(
-          (a) => a.iterationId === round.id && a.delivery === round.delivery,
-        )
-        .at(-1)
-    : history.at(-1);
+  const { result, last, execution } = executionResult(history, round, results);
   let status: "ready" | "running" | "completed" | "failed" =
     last || round ? "running" : "ready";
   let action: Action | null = last
@@ -56,10 +75,10 @@ export function stepProgress(
     : round
       ? "run"
       : null;
-  let error: AttemptError | null = round?.error ?? last?.error ?? null;
+  let error: AttemptError | null = result?.error ?? last?.error ?? null;
   let finishedAt: number | null = null;
   if (!round) {
-    // Historical per-action records remain readable, but have no new scheduling policy.
+    // Historical per-action records remain readable, with their original semantics.
     if (last?.status === "completed" && !action) {
       status = "completed";
       finishedAt = last.finishedAt;
@@ -69,13 +88,13 @@ export function stepProgress(
       action = null;
       finishedAt = last.finishedAt;
     }
-  } else if (round.status === "failed") {
+  } else if (result?.error) {
     status = "failed";
     action = null;
-    finishedAt = round.finishedAt;
-  } else if (round.status === "completed") {
+    finishedAt = result.finishedAt;
+  } else if (result) {
     if (!last || last.status !== "completed")
-      throw new Error("Completed iteration has no completed action");
+      throw new Error("Final iteration result has no completed action");
     const rejected = improvement(last);
     if (rejected) {
       action = "run";
@@ -83,7 +102,7 @@ export function stepProgress(
       if (round.iteration >= MAX_ITERATIONS) {
         status = "failed";
         action = null;
-        finishedAt = round.finishedAt;
+        finishedAt = result.finishedAt;
         error = {
           source: rejected.source,
           name: "ImprovementLimitExceeded",
@@ -101,10 +120,8 @@ export function stepProgress(
       status = "completed";
       action = null;
       error = null;
-      finishedAt = round.finishedAt;
+      finishedAt = result.finishedAt;
     }
-  } else if (round.status === "retrying") {
-    action = "run";
   }
-  return { status, action, error, finishedAt };
+  return { status, action, error, finishedAt, execution, result };
 }

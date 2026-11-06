@@ -9,6 +9,7 @@ import type {
   GoalStatus,
   JsonValue,
   Iteration,
+  IterationResult,
 } from "../types.ts";
 
 interface GoalRow {
@@ -25,6 +26,7 @@ interface AttemptRow {
   iteration_id: number | null;
   iteration: number | null;
   delivery: number | null;
+  dispatch_token: string | null;
   goal_id: number;
   step_name: string;
   action: Action | null;
@@ -55,6 +57,7 @@ function attempt(row: AttemptRow): Attempt {
     iterationId: row.iteration_id,
     iteration: row.iteration,
     delivery: row.delivery,
+    dispatchToken: row.dispatch_token,
     goalId: row.goal_id,
     stepName: row.step_name,
     action: row.action,
@@ -198,14 +201,8 @@ interface IterationRow {
   goal_id: number;
   step_name: string;
   iteration: number;
-  status: Iteration["status"];
-  dispatch_token: string | null;
-  message_id: string | null;
-  delivery: number;
-  token: string | null;
-  error_json: string | null;
+  dispatch_status: Iteration["dispatchStatus"];
   created_at: number;
-  finished_at: number | null;
 }
 function iteration(row: IterationRow): Iteration {
   return {
@@ -213,17 +210,42 @@ function iteration(row: IterationRow): Iteration {
     goalId: row.goal_id,
     stepName: row.step_name,
     iteration: row.iteration,
-    status: row.status,
-    dispatchToken: row.dispatch_token,
-    messageId: row.message_id,
-    delivery: row.delivery,
-    token: row.token,
-    error: row.error_json === null ? null : JSON.parse(row.error_json),
+    dispatchStatus: row.dispatch_status,
     createdAt: row.created_at,
-    finishedAt: row.finished_at,
   };
 }
 export class ExecutionStopped extends Error {}
+
+export async function listIterationResults(
+  db: DatabaseBinding,
+  goalId?: number,
+): Promise<IterationResult[]> {
+  const query = `SELECT r.* FROM cfordo_iteration_results r
+    JOIN cfordo_iterations i ON i.id = r.iteration_id`;
+  const result = await db
+    .prepare(
+      query +
+        (goalId === undefined ? "" : " WHERE i.goal_id = ?") +
+        " ORDER BY r.id",
+    )
+    .bind(...(goalId === undefined ? [] : [goalId]))
+    .all<{
+      id: number;
+      iteration_id: number;
+      attempt_id: number | null;
+      error_json: string | null;
+      finished_at: number;
+    }>();
+  if (!result.success)
+    throw new Error(result.error || "Iteration result query failed");
+  return (result.results ?? []).map((row) => ({
+    id: row.id,
+    iterationId: row.iteration_id,
+    attemptId: row.attempt_id,
+    error: row.error_json === null ? null : JSON.parse(row.error_json),
+    finishedAt: row.finished_at,
+  }));
+}
 
 export async function listIterations(
   db: DatabaseBinding,
@@ -287,8 +309,8 @@ export async function reserveDispatch(
   const now = Date.now();
   const result = await db
     .prepare(
-      `UPDATE cfordo_iterations SET status='sending', dispatch_token=?, dispatch_until=?
-    WHERE id=? AND (status='ready' OR (status='sending' AND dispatch_until <= ?))
+      `UPDATE cfordo_iterations SET dispatch_status='sending', dispatch_token=?, dispatch_until=?
+    WHERE id=? AND (dispatch_status='ready' OR (dispatch_status='sending' AND dispatch_until <= ?))
     AND EXISTS (SELECT 1 FROM cfordo_goals g WHERE g.id=goal_id AND g.status='running' AND g.expires_at>?)`,
     )
     .bind(token, now + 60_000, id, now, now)
@@ -305,51 +327,19 @@ export async function finishDispatch(
 ): Promise<void> {
   const result = await db
     .prepare(
-      `UPDATE cfordo_iterations SET status=?, dispatch_until=NULL
-    WHERE id=? AND status='sending' AND dispatch_token=?`,
+      `UPDATE cfordo_iterations SET dispatch_status=?, dispatch_until=NULL
+    WHERE id=? AND dispatch_status='sending' AND dispatch_token=?`,
     )
     .bind(sent ? "queued" : "ready", id, token)
     .run();
   if (!result.success)
     throw new Error(result.error || "Dispatch update failed");
 }
-export async function claimIteration(
-  db: DatabaseBinding,
-  id: number,
-  messageId: string,
-  delivery: number,
-  token: string,
-): Promise<boolean> {
-  const now = Date.now();
-  const interrupted = JSON.stringify({
-    source: "queue",
-    name: "QueueRedelivery",
-    message: "Previous delivery ended before this action completed",
-  });
-  const results = await db.batch([
-    db
-      .prepare(
-        `UPDATE cfordo_iterations SET status='running', message_id=?, delivery=?, token=?, error_json=NULL
-      WHERE id=? AND status NOT IN ('completed','failed') AND (message_id IS NULL OR message_id=?) AND delivery<?
-      AND EXISTS (SELECT 1 FROM cfordo_goals g WHERE g.id=goal_id AND g.status='running' AND g.expires_at>?)`,
-      )
-      .bind(messageId, delivery, token, id, messageId, delivery, now),
-    db
-      .prepare(
-        `UPDATE cfordo_attempts SET status='failed', error_json=?, finished_at=?
-      WHERE iteration_id=? AND delivery<? AND status='running'
-      AND EXISTS (SELECT 1 FROM cfordo_iterations i WHERE i.id=iteration_id AND i.token=?)`,
-      )
-      .bind(interrupted, now, id, delivery, token),
-  ]);
-  const failure = results.find((r) => !r.success);
-  if (failure) throw new Error(failure.error || "Iteration claim failed");
-  return results[0].meta.changes === 1;
-}
 export async function beginAttempt(
   db: DatabaseBinding,
   round: Iteration,
-  token: string,
+  dispatchToken: string,
+  delivery: number,
   action: Action,
   sourceRunId: number | null,
   predecessorId: number | null,
@@ -358,14 +348,22 @@ export async function beginAttempt(
   const row = await db
     .prepare(
       `INSERT INTO cfordo_attempts
-    (goal_id,step_name,worker_name,action,predecessor_id,source_run_id,status,created_at,iteration_id,delivery)
-    SELECT goal_id,step_name,step_name,?,?,?,'running',?,id,delivery FROM cfordo_iterations
-    WHERE id=? AND status='running' AND token=?
-    AND EXISTS (SELECT 1 FROM cfordo_goals g WHERE g.id=goal_id AND g.status='running' AND g.expires_at>?) RETURNING id`,
+    (goal_id,step_name,worker_name,action,predecessor_id,source_run_id,status,created_at,iteration_id,delivery,dispatch_token)
+    SELECT goal_id,step_name,step_name,?,?,?,'running',?,id,?,? FROM cfordo_iterations
+    WHERE id=? AND EXISTS (SELECT 1 FROM cfordo_goals g WHERE g.id=goal_id AND g.expires_at>?) RETURNING id`,
     )
-    .bind(action, predecessorId, sourceRunId, now, round.id, token, now)
+    .bind(
+      action,
+      predecessorId,
+      sourceRunId,
+      now,
+      delivery,
+      dispatchToken,
+      round.id,
+      now,
+    )
     .first<{ id: number }>();
-  if (!row) throw new ExecutionStopped("Iteration is no longer active");
+  if (!row) throw new ExecutionStopped("Goal has expired");
   return getAttempt(db, row.id);
 }
 const outcomeColumns = {
@@ -376,118 +374,91 @@ const outcomeColumns = {
 export async function saveOutcome(
   db: DatabaseBinding,
   attempt: Attempt,
-  token: string,
   value: JsonValue | CheckResult,
 ): Promise<void> {
   if (!attempt.action) throw new Error("Action missing");
   const result = await db
     .prepare(
       `UPDATE cfordo_attempts SET ${outcomeColumns[attempt.action]}=?
-    WHERE id=? AND status='running' AND EXISTS
-      (SELECT 1 FROM cfordo_iterations i WHERE i.id=iteration_id AND i.status='running' AND i.token=?)`,
+    WHERE id=? AND status='running'`,
     )
-    .bind(JSON.stringify(value), attempt.id, token)
+    .bind(JSON.stringify(value), attempt.id)
     .run();
   if (!result.success) throw new Error(result.error || "Outcome save failed");
-  if (result.meta.changes !== 1)
-    throw new ExecutionStopped("Delivery no longer owns this action");
+  if (result.meta.changes !== 1) throw new Error("Action is no longer running");
 }
 export async function finishAttempt(
   db: DatabaseBinding,
   attempt: Attempt,
-  token: string,
 ): Promise<void> {
   const result = await db
     .prepare(
       `UPDATE cfordo_attempts SET status='completed', finished_at=?
-    WHERE id=? AND status='running' AND ${outcomeColumns[attempt.action!]} IS NOT NULL
-    AND EXISTS (SELECT 1 FROM cfordo_iterations i WHERE i.id=iteration_id AND i.status='running' AND i.token=?)`,
+    WHERE id=? AND status='running' AND ${outcomeColumns[attempt.action!]} IS NOT NULL`,
     )
-    .bind(Date.now(), attempt.id, token)
+    .bind(Date.now(), attempt.id)
     .run();
   if (!result.success)
     throw new Error(result.error || "Action completion failed");
   if (result.meta.changes !== 1)
-    throw new ExecutionStopped("Delivery no longer owns this action");
+    throw new Error("Action has no saved outcome or has already ended");
 }
-export async function finishIteration(
+
+export async function saveIterationResult(
   db: DatabaseBinding,
-  id: number,
-  token: string,
+  iterationId: number,
+  attemptId: number | null,
+  error?: AttemptError,
+): Promise<void> {
+  // This insert's ID is the order of final-result persistence, including ties in timestamps.
+  const result = await db
+    .prepare(
+      `INSERT INTO cfordo_iteration_results (iteration_id,attempt_id,error_json,finished_at)
+      VALUES (?,?,?,?)`,
+    )
+    .bind(
+      iterationId,
+      attemptId,
+      error ? JSON.stringify(error) : null,
+      Date.now(),
+    )
+    .run();
+  if (!result.success)
+    throw new Error(result.error || "Iteration result save failed");
+}
+
+export async function failAttempt(
+  db: DatabaseBinding,
+  attempt: Attempt,
+  error: AttemptError,
 ): Promise<void> {
   const result = await db
     .prepare(
-      `UPDATE cfordo_iterations SET status='completed', finished_at=?, error_json=NULL
-    WHERE id=? AND status='running' AND token=?`,
+      `UPDATE cfordo_attempts SET status='failed',error_json=?,finished_at=?
+      WHERE id=? AND status='running'`,
     )
-    .bind(Date.now(), id, token)
+    .bind(JSON.stringify(error), Date.now(), attempt.id)
     .run();
   if (!result.success)
-    throw new Error(result.error || "Iteration completion failed");
-  if (result.meta.changes !== 1)
-    throw new ExecutionStopped("Delivery no longer owns this iteration");
+    throw new Error(result.error || "Action failure save failed");
 }
-export async function recordIterationError(
-  db: DatabaseBinding,
-  id: number,
-  token: string,
-  error: AttemptError,
-): Promise<void> {
-  const now = Date.now();
-  const json = JSON.stringify(error);
-  const results = await db.batch([
-    db
-      .prepare(
-        `UPDATE cfordo_attempts SET status='failed',error_json=?,finished_at=?
-      WHERE iteration_id=? AND status='running' AND EXISTS
-      (SELECT 1 FROM cfordo_iterations i WHERE i.id=iteration_id AND i.status='running' AND i.token=?)`,
-      )
-      .bind(json, now, id, token),
-    db
-      .prepare(
-        `UPDATE cfordo_iterations SET status='retrying',error_json=? WHERE id=? AND status='running' AND token=?`,
-      )
-      .bind(json, id, token),
-  ]);
-  const failure = results.find((r) => !r.success);
-  if (failure)
-    throw new Error(failure.error || "Queue exception could not be recorded");
-}
+
 export async function exhaustIteration(
   db: DatabaseBinding,
-  id: number,
+  round: Iteration,
+  dispatchToken: string,
 ): Promise<void> {
-  const current = await getIteration(db, id);
-  if (current.status === "completed" || current.status === "failed") return;
-  const error: AttemptError = {
+  const history = await listAttempts(db, round.goalId, round.stepName);
+  const last = history
+    .filter(
+      (a) => a.iterationId === round.id && a.dispatchToken === dispatchToken,
+    )
+    .at(-1);
+  await saveIterationResult(db, round.id, last?.id ?? null, {
     source: "queue",
     name: "QueueRetriesExhausted",
-    message: current.error
-      ? `Queue retries exhausted: ${current.error.message}`
+    message: last?.error
+      ? `Queue retries exhausted: ${last.error.message}`
       : "Queue retries exhausted before the iteration completed",
-  };
-  const now = Date.now();
-  const json = JSON.stringify(error);
-  const results = await db.batch([
-    db
-      .prepare(
-        `UPDATE cfordo_iterations SET status='failed',error_json=?,finished_at=? WHERE id=? AND status NOT IN ('completed','failed')`,
-      )
-      .bind(json, now, id),
-    db
-      .prepare(
-        `UPDATE cfordo_attempts SET status='failed',error_json=?,finished_at=? WHERE iteration_id=? AND status='running'
-      AND EXISTS (SELECT 1 FROM cfordo_iterations i WHERE i.id=iteration_id AND i.status='failed')`,
-      )
-      .bind(json, now, id),
-    db
-      .prepare(
-        `UPDATE cfordo_goals SET status='failed',error_json=?,finished_at=? WHERE id=? AND status IN ('ready','running') AND expires_at>?
-      AND EXISTS (SELECT 1 FROM cfordo_iterations i WHERE i.id=? AND i.status='failed')`,
-      )
-      .bind(json, now, current.goalId, now, id),
-  ]);
-  const failure = results.find((r) => !r.success);
-  if (failure)
-    throw new Error(failure.error || "Queue exhaustion could not be recorded");
+  });
 }

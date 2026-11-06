@@ -1,10 +1,12 @@
 import initial from "./migrations/0001_init.sql";
 import cronIterations from "./migrations/0002_cron_iterations.sql";
+import executionResults from "./migrations/0003_execution_results.sql";
 import type { DatabaseBinding } from "../types.ts";
 
 const migrations = [
   { id: 1, sql: initial },
   { id: 2, sql: cronIterations },
+  { id: 3, sql: executionResults },
 ];
 
 // Split our migration statements without splitting quoted values or comments.

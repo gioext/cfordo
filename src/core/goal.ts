@@ -1,12 +1,5 @@
 import { initOrdo } from "../db/init.ts";
-import {
-  getGoal,
-  insertGoal,
-  listGoals,
-  listAttempts,
-  listAllAttempts,
-  listIterations,
-} from "../db/store.ts";
+import { getGoal, insertGoal, listGoals } from "../db/store.ts";
 import type {
   EffectiveGoalStatus,
   Goal,
@@ -19,9 +12,11 @@ import type {
   StepResult,
   ExecutionDetail,
   Iteration,
+  IterationResult,
 } from "../types.ts";
 import { assertJson } from "./validation.ts";
 import { stepProgress } from "./progress.ts";
+import { readResults } from "./engine.ts";
 
 export function getGoalStatus(
   goal: Goal,
@@ -70,18 +65,20 @@ function stepResult(
   name: string,
   history: Attempt[],
   rounds: Iteration[],
+  results: IterationResult[],
   definition: RegisteredStep | undefined,
   goalStatus: EffectiveGoalStatus,
   expiresAt: number,
 ): StepResult {
-  const last = history.at(-1);
-  const run = history
+  const progress = stepProgress(history, rounds, results, definition);
+  const last = progress.execution.at(-1);
+  const run = progress.execution
     .slice()
     .reverse()
     .find((item) => item.action === "run");
   // Only checks of this run belong beside its output, including a retry of a check.
   const checks = run
-    ? history.filter((item) => item.sourceRunId === run.id)
+    ? progress.execution.filter((item) => item.sourceRunId === run.id)
     : [];
   const validation = checks
     .slice()
@@ -91,7 +88,6 @@ function stepResult(
     .slice()
     .reverse()
     .find((item) => item.action === "evaluate");
-  const progress = stepProgress(history, rounds, definition);
   let { status, action } = progress as {
     status: EffectiveGoalStatus;
     action: StepResult["action"];
@@ -133,12 +129,12 @@ export async function readResult<T>(
   definition: RegisteredStep,
 ): Promise<T> {
   const goal = await getGoal(db, goalId);
-  const history = await listAttempts(db, goalId, definition.name);
-  const rounds = await listIterations(db, goalId, definition.name);
+  const { history, rounds, results } = await readResults(db, goalId);
   const result = stepResult(
     definition.name,
-    history,
-    rounds,
+    history.filter((a) => a.stepName === definition.name),
+    rounds.filter((r) => r.stepName === definition.name),
+    results,
     definition,
     getGoalStatus(goal),
     goal.expiresAt,
@@ -157,6 +153,7 @@ function summary(
   definitions: readonly RegisteredStep[],
   history: Attempt[],
   rounds: Iteration[],
+  outcomes: IterationResult[],
 ): GoalSummary {
   const byStep = new Map<string, Attempt[]>();
   for (const item of history) {
@@ -174,6 +171,7 @@ function summary(
       name,
       byStep.get(name) ?? [],
       rounds.filter((round) => round.stepName === name),
+      outcomes,
       definitions.find((item) => item.name === name),
       status,
       goal.expiresAt,
@@ -205,9 +203,16 @@ export async function readGoal(
   const goal = await getGoal(db, id);
   const status = getGoalStatus(goal);
   const error = errorInfo(goal.error);
-  const history = await listAttempts(db, id);
-  const rounds = await listIterations(db, id);
-  const result = summary(goal, status, error, definitions, history, rounds);
+  const { history, rounds, results } = await readResults(db, id);
+  const result = summary(
+    goal,
+    status,
+    error,
+    definitions,
+    history,
+    rounds,
+    results,
+  );
   return {
     ...result,
     results: result.results.map((item) => ({
@@ -225,8 +230,7 @@ export async function readGoals(
 ): Promise<GoalSummary[]> {
   await initOrdo(db);
   const goals = await listGoals(db);
-  const history = await listAllAttempts(db);
-  const rounds = await listIterations(db);
+  const { history, rounds, results } = await readResults(db);
   const byGoal = new Map<number, Attempt[]>();
   for (const item of history) {
     const group = byGoal.get(item.goalId) ?? [];
@@ -241,6 +245,7 @@ export async function readGoals(
       definitions,
       byGoal.get(goal.id) ?? [],
       rounds.filter((round) => round.goalId === goal.id),
+      results,
     ),
   );
 }

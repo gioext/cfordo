@@ -1,42 +1,28 @@
-import { stepProgress } from "./progress.ts";
 import {
-  ensureIteration,
   finishDispatch,
-  getGoal,
+  listAllAttempts,
   listAttempts,
+  listIterationResults,
   listIterations,
   reserveDispatch,
-  updateGoal,
 } from "../db/store.ts";
-import type { OrdoEnv, RegisteredStep } from "../types.ts";
-import { getGoalStatus } from "./goal.ts";
+import type { DatabaseBinding, Iteration, OrdoEnv } from "../types.ts";
 
-export async function executeStep(
+export async function readResults(db: DatabaseBinding, goalId?: number) {
+  // Read final results first so each referenced action exists in the later history read.
+  const results = await listIterationResults(db, goalId);
+  const rounds = await listIterations(db, goalId);
+  const history =
+    goalId === undefined
+      ? await listAllAttempts(db)
+      : await listAttempts(db, goalId);
+  return { results, rounds, history };
+}
+
+export async function dispatchIteration(
   env: OrdoEnv,
-  goalId: number,
-  definition: RegisteredStep,
+  round: Iteration,
 ): Promise<void> {
-  if (getGoalStatus(await getGoal(env.DB, goalId)) !== "running") return;
-  const history = await listAttempts(env.DB, goalId, definition.name);
-  let rounds = await listIterations(env.DB, goalId, definition.name);
-  const progress = stepProgress(history, rounds, definition);
-  if (progress.status === "failed") {
-    await updateGoal(env.DB, goalId, "failed", progress.error ?? undefined);
-    return;
-  }
-  if (progress.status === "completed") return;
-  let round = rounds.at(-1);
-  if (!round || round.status === "completed") {
-    await ensureIteration(
-      env.DB,
-      goalId,
-      definition.name,
-      (round?.iteration ?? 0) + 1,
-    );
-    rounds = await listIterations(env.DB, goalId, definition.name);
-    round = rounds.at(-1);
-  }
-  if (!round) return;
   const token = crypto.randomUUID();
   if (!(await reserveDispatch(env.DB, round.id, token))) return;
   try {

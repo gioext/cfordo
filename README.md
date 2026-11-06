@@ -95,7 +95,7 @@ The [complete example](example/src/index.ts) includes validation and evaluation 
 ### Input, results, and bindings
 
 Between steps, obtain data from D1 rather than shared variables, closures, or return values. The handlers within one iteration share a context.
-At the start of each iteration, Ordo loads the Goal input and previous iteration's feedback from D1. Checks read the result saved by the run in this iteration.
+At the start of each execution, Ordo loads the Goal input and feedback from the previous iteration's first final result in D1. Checks read the result saved by the run in this iteration.
 
 | API or value                    | Purpose                                                                                   |
 | ------------------------------- | ----------------------------------------------------------------------------------------- |
@@ -130,10 +130,11 @@ A phase completes after saving its required outcome and returning successfully. 
 - Exceptions use Queue retries to restart the same iteration from run. Previously successful phases can execute again; external side effects must be idempotent.
 - Queue retries do not change the iteration number or previous iteration's feedback. Exceptions do not consume improvement iterations.
 - Cron does not resend queued, running, or retrying iterations. Failed sends can be retried by Cron; an interrupted send becomes eligible after its one-minute send-confirmation deadline.
-- Redelivery of a finalized iteration neither executes its handlers nor changes its results.
-- Messages that exhaust Queue retries are handled by the native DLQ and recorded as `QueueRetriesExhausted` in D1. Cron does not reset the Queue retry budget by sending a new message.
+- Every received copy of a job executes and stores its own results. The existing Goal expiration still prevents new phases from starting after the deadline.
+- For the same Goal, step, and improvement iteration, use the first whole-execution result persisted in D1. Execution start order and run-only persistence do not determine the winner. A later OK cannot replace an earlier NG, and late results of earlier iterations cannot change current progress.
+- Messages that exhaust Queue retries are handled by the native DLQ, which saves a final `QueueRetriesExhausted` result in D1. The next Cron determines Goal termination from the first final result for that iteration. A later DLQ report does not replace an earlier success or negative verdict. Cron does not reset the Queue retry budget by sending a new message.
 
-History preserves phases from each Queue execution. `executions.iteration` identifies the improvement iteration and `delivery` identifies the Queue delivery attempt. These fields are omitted on historical records from the earlier format.
+History preserves phases from each Queue execution. `executions.iteration` identifies the improvement iteration and `delivery` identifies the Queue delivery attempt. Different messages or duplicate deliveries may have the same delivery attempt number. Each phase has its own `attemptId`, and `sourceRunId` associates checks with their run. These fields are omitted on historical records from the earlier format.
 Successful example Goals still have three records per step and nine in total. An iteration rejected by validation has no evaluation record.
 
 Expiration is fixed at acceptance and never extended by improvement or retries. The default is 24 hours; change it with `ordo.configure({ deadLetterQueue: "...", expiresIn: milliseconds })`.
@@ -150,10 +151,10 @@ No new phases start after expiration. Already-running code is not guaranteed to 
 Common fields are `goalId`, `input`, `status`, `createdAt`, `expiresAt`, `finishedAt`, `error`, and `results`.
 Status is `ready`, `running`, `completed`, `failed`, or `expired`. Dates are Unix epoch milliseconds; an unobserved finish time is `null`.
 Each result contains `stepName`, `status`, `action`, `output`, `validation`, `evaluation`, `error`, `createdAt`, and `finishedAt`. Unstarted steps are included.
-`action` identifies the current or next action and is `null` after step completion. Output and verdicts refer to the same run; missing values are `null`.
+`action` identifies the current or next action and is `null` after step completion. An iteration with final results displays its first final result; otherwise it displays execution progress for that iteration. Output and verdicts refer to the same run; missing values are `null`.
 In-flight and failed outputs can be visible. Only accept a step's result when its status is `completed`.
 
-Only detail responses contain `executions`, ordered by execution record ID. List responses omit them.
+Only detail responses contain `executions`, including executions not used for progress, ordered by execution record ID. List responses omit them.
 Entries contain `attemptId`, `action`, `sourceRunId`, `status`, `output`, `verdict`, `error`, `createdAt`, and `finishedAt`.
 `sourceRunId` identifies the checked run and is `null` for run itself. Verdicts are `{ "ok": true }` or `{ "ok": false, "reason": "..." }`.
 Errors are `{ "code": "...", "message": "..." }`, or `null` when absent.

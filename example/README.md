@@ -22,7 +22,7 @@
 - validate・evaluateのNGは改善ループとして合算し、初回込みで最大10周。NGの次の周へは`ctx.feedback`でiteration・source・reasonを渡す。validateがNGならevaluateを実行しない。
 - 例外はQueueのリトライで同じ周のrunから再実行し、改善回数を増やさない。各配送で実行した段階の履歴は残る。
 - `ctx.feedback`の初回は`{ iteration: 1, source: null, reason: null }`。同じ周では変更しない。
-- Queueのリトライ上限後はDLQで受け取り、Goalを失敗にする。DLQ名は`ordo.configure({ deadLetterQueue: "example-ordo-queue-dlq" })`へ指定する。
+- Queueのリトライ上限後はDLQで失敗結果を保存し、次のCronで、その周回の最初の確定結果に従ってGoalの終了が決まる。DLQ名は`ordo.configure({ deadLetterQueue: "example-ordo-queue-dlq" })`へ指定する。
 - runは`ctx.complete(data)`、検証・評価は`ctx.ok()`・`ctx.ng(reason)`で保存する。それぞれawaitするかPromiseを返す。
 - 公開URLは無効。内部HTTP APIはサービスBinding経由で利用する。外部AI APIは使用しない。
 
@@ -102,7 +102,10 @@ pnpm --filter @cfordo/example request GET /_ordo/goals/1
 - 公開URLからはAPIを利用できず、サービスBinding経由では利用できること。
 - 実際のCronで進行し、通常の配送待ち・実行中・Queueのリトライ待ちを再送しないこと。
 - 本番exampleで共有ctx、validateのNGによるevaluate省略、両判定のNGからの改善、10周の共通上限、各段階の例外リトライが改善回数を消費しないことを確認する。
-- Queueの例外リトライ上限後にDLQで失敗が確定すること。
+- Queueの例外リトライ上限後にDLQが失敗結果を保存し、その後のCronでGoalが失敗になること。
+- 同じ周回の仕事を複数回送信し、各実行のrun・validate・evaluateが別々に保存され、実行開始順によらず最初に保存された確定結果を使うこと。
+- 最初の確定結果がNGなら後続のOKで変更されず、次の周回へそのNG理由が渡ること。遅れて届いた前周の結果やDLQの報告でも変更されないこと。
+- 一覧・詳細・後続工程の取得結果が同じ確定結果を参照し、採用しなかった実行も詳細の履歴に残ること。
 - APIの入力・結果・判定・履歴を本番D1の保存記録と照合すること。
 
 | 入力 | double | square | sum |

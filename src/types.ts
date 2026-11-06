@@ -115,21 +115,17 @@ export interface Iteration {
   goalId: number;
   stepName: string;
   iteration: number;
-  status:
-    | "ready"
-    | "sending"
-    | "queued"
-    | "running"
-    | "retrying"
-    | "completed"
-    | "failed";
-  dispatchToken: string | null;
-  messageId: string | null;
-  delivery: number;
-  token: string | null;
-  error: AttemptError | null;
+  dispatchStatus: "ready" | "sending" | "queued";
   createdAt: number;
-  finishedAt: number | null;
+}
+
+/** Appended only when an entire execution finishes, or the DLQ reports failure. */
+export interface IterationResult {
+  id: number;
+  iterationId: number;
+  attemptId: number | null;
+  error: AttemptError | null;
+  finishedAt: number;
 }
 
 export interface Attempt {
@@ -137,6 +133,7 @@ export interface Attempt {
   iterationId: number | null;
   iteration: number | null;
   delivery: number | null;
+  dispatchToken: string | null;
   goalId: number;
   stepName: string;
   action: Action | null;

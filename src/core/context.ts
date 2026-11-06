@@ -17,7 +17,6 @@ export function createContext<Env extends OrdoEnv>(
   stepName: string,
   params: JsonValue,
   feedback: ImprovementFeedback,
-  token: string,
   definitions: ReadonlyMap<string, RegisteredStep<Env>>,
 ) {
   let current: Attempt;
@@ -46,7 +45,7 @@ export function createContext<Env extends OrdoEnv>(
       if (current.action !== "run")
         throw new TypeError("complete() is only available to run");
       assertJson(value, "Business result");
-      await saveOutcome(env.DB, current, token, value);
+      await saveOutcome(env.DB, current, value);
       saved = true;
     },
     async ok(): Promise<void> {
@@ -54,7 +53,7 @@ export function createContext<Env extends OrdoEnv>(
         throw new TypeError("ok() does not accept arguments");
       if (current.action !== "validate" && current.action !== "evaluate")
         throw new TypeError("ok() is only available to checks");
-      await saveOutcome(env.DB, current, token, { ok: true });
+      await saveOutcome(env.DB, current, { ok: true });
       saved = true;
     },
     async ng(reason: string): Promise<void> {
@@ -66,7 +65,7 @@ export function createContext<Env extends OrdoEnv>(
         throw new TypeError("ng() requires one non-empty reason");
       if (current.action !== "validate" && current.action !== "evaluate")
         throw new TypeError("ng() is only available to checks");
-      await saveOutcome(env.DB, current, token, { ok: false, reason });
+      await saveOutcome(env.DB, current, { ok: false, reason });
       saved = true;
     },
   });

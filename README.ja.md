@@ -92,7 +92,7 @@ ordo.step<{ value: number }>({
 ### 入力・結果・Bindings
 
 工程間で変数・クロージャ・戻り値を共有せず、必要な値をD1の保存結果から取得する。
-各周回の開始時にGoal入力と前周の改善理由をD1から読み込む。runが保存した今回の結果をvalidate・evaluateが参照する。
+各実行の開始時にGoal入力と、前周で最初に確定した結果の改善理由をD1から読み込む。runが保存した今回の結果をvalidate・evaluateが参照する。
 
 | API・値                         | 用途                                                                                  |
 | ------------------------------- | ------------------------------------------------------------------------------------- |
@@ -127,10 +127,11 @@ Binding名は`DB`（D1）と`QUEUE`（専用Queue）に固定する。`Env`は`O
 - 途中の例外はQueueのリトライで同じ周のrunからやり直す。成功済みの段階も実行され得るため、外部への副作用は冪等に扱うこと。
 - Queueのリトライではiterationと前周のfeedbackを変えない。例外回数を改善回数に加算しない。
 - 配送待ち・実行中・Queueのリトライ待ちはCronから再送しない。送信失敗は次のCronで再送し、送信途中の停止は1分の送信確認期限後に再送可能となる。
-- 確定済みの周回の重複配送では処理を実行せず、保存済み結果も変更しない。
-- Queueの再試行上限を超えたメッセージは標準DLQで受け取り、D1へ`QueueRetriesExhausted`として失敗を確定する。Cronで新しいメッセージに置き換えてQueueの上限をリセットしない。
+- 同じ仕事を複数回受信した場合は、それぞれ実行して結果を別々に保存する。期限後に新しい処理を開始しない制約は維持する。
+- 同じGoal・工程・改善周回では、周回全体の確定結果がD1へ最初に保存された実行を使う。開始順やrun単体の保存順では決めない。最初がNGなら後からOKが届いても変更せず、前の周回の遅れた結果も現在の進行を変更しない。
+- Queueの再試行上限を超えたメッセージは標準DLQで受け取り、D1へ`QueueRetriesExhausted`の確定結果を保存する。次のCronで、その周回の最初の確定結果に従ってGoalの終了を判断する。先に成功やNGが確定していれば、後から届いたDLQの結果で変更しない。Cronで新しいメッセージに置き換えてQueueの上限をリセットしない。
 
-Queueの各再実行で行った段階も履歴に残す。`executions`の`iteration`は改善周回、`delivery`はQueueの配送試行番号で、両者を区別できる。旧形式の履歴ではこれらのフィールドを省略する。
+Queueの各再実行で行った段階も履歴に残す。`executions`の`iteration`は改善周回、`delivery`はQueueの配送試行番号で、両者を区別できる。異なるメッセージや重複受信では同じ配送試行番号になる場合があるが、各段階の`attemptId`と対象runの`sourceRunId`で実行を区別できる。旧形式の履歴ではこれらのフィールドを省略する。
 正常時の履歴は各工程run・validate・evaluateの3件で、example全体では9件。validateがNGの周にはevaluateの履歴を作らない。
 
 期限はGoal受付時に固定し、改善やリトライで延長しない。既定は24時間。`ordo.configure({ deadLetterQueue: "...", expiresIn: ミリ秒 })`で変更できる。
@@ -147,10 +148,10 @@ Queueの各再実行で行った段階も履歴に残す。`executions`の`itera
 共通フィールドは`goalId`・`input`・`status`・`createdAt`・`expiresAt`・`finishedAt`・`error`・`results`。
 状態は`ready`・`running`・`completed`・`failed`・`expired`。日時はUnix時刻のミリ秒。未確定の終了日時は`null`。
 結果は`stepName`・`status`・`action`・`output`・`validation`・`evaluation`・`error`・`createdAt`・`finishedAt`を持ち、未開始の工程も含む。
-`action`は現在または次の処理。完了した工程では`null`。出力と判定は同じrunに対応し、未保存・未実施は`null`。
+`action`は現在または次の処理。完了した工程では`null`。確定結果がある周回では最初の確定結果を表示し、確定前はその周回の途中経過を表示する。出力と判定は同じrunに対応し、未保存・未実施は`null`。
 途中・失敗時の出力も表示されるため、結果の採用時には工程の`status`が`completed`であることを確認する。
 
-詳細だけは工程ごとに`executions`を含み、実行記録ID昇順で返す。一覧には含めない。
+詳細だけは工程ごとに`executions`を含み、進行に使わなかった実行も含めて実行記録ID昇順で返す。一覧には含めない。
 各記録は`attemptId`・`action`・`sourceRunId`・`status`・`output`・`verdict`・`error`・`createdAt`・`finishedAt`を持つ。
 `sourceRunId`は検証・評価の対象runのIDで、run自身では`null`。
 判定は`{ "ok": true }`または`{ "ok": false, "reason": "..." }`。
