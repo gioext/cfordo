@@ -119,7 +119,7 @@ export interface Iteration {
   createdAt: number;
 }
 
-/** Appended only when an entire execution finishes, or the DLQ reports failure. */
+/** Projection of a final execution record in the shared history table. */
 export interface IterationResult {
   id: number;
   iterationId: number;

@@ -220,13 +220,12 @@ export async function listIterationResults(
   db: DatabaseBinding,
   goalId?: number,
 ): Promise<IterationResult[]> {
-  const query = `SELECT r.* FROM cfordo_iteration_results r
-    JOIN cfordo_iterations i ON i.id = r.iteration_id`;
+  // Final records share the history table. Legacy action-less rows have no iteration.
+  const query = `SELECT id, iteration_id, predecessor_id AS attempt_id, error_json, finished_at
+    FROM cfordo_attempts WHERE iteration_id IS NOT NULL AND action IS NULL`;
   const result = await db
     .prepare(
-      query +
-        (goalId === undefined ? "" : " WHERE i.goal_id = ?") +
-        " ORDER BY r.id",
+      query + (goalId === undefined ? "" : " AND goal_id = ?") + " ORDER BY id",
     )
     .bind(...(goalId === undefined ? [] : [goalId]))
     .all<{
@@ -410,21 +409,28 @@ export async function saveIterationResult(
   attemptId: number | null,
   error?: AttemptError,
 ): Promise<void> {
-  // This insert's ID is the order of final-result persistence, including ties in timestamps.
+  // Append after the execution ends: this ID records final persistence order.
+  // action=NULL keeps the record out of the public run/validate/evaluate history.
+  const now = Date.now();
   const result = await db
     .prepare(
-      `INSERT INTO cfordo_iteration_results (iteration_id,attempt_id,error_json,finished_at)
-      VALUES (?,?,?,?)`,
+      `INSERT INTO cfordo_attempts
+      (goal_id,step_name,worker_name,iteration_id,predecessor_id,status,error_json,created_at,finished_at)
+      SELECT goal_id,step_name,step_name,id,?,?,?,?,? FROM cfordo_iterations WHERE id=?`,
     )
     .bind(
-      iterationId,
       attemptId,
+      error ? "failed" : "completed",
       error ? JSON.stringify(error) : null,
-      Date.now(),
+      now,
+      now,
+      iterationId,
     )
     .run();
   if (!result.success)
     throw new Error(result.error || "Iteration result save failed");
+  if (result.meta.changes !== 1)
+    throw new Error("Iteration missing while saving its result");
 }
 
 export async function failAttempt(

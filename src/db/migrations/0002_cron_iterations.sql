@@ -12,19 +12,15 @@ CREATE TABLE cfordo_iterations (
   goal_id INTEGER NOT NULL REFERENCES cfordo_goals(id),
   step_name TEXT NOT NULL,
   iteration INTEGER NOT NULL CHECK (iteration BETWEEN 1 AND 10),
-  status TEXT NOT NULL DEFAULT 'ready',
+  dispatch_status TEXT NOT NULL DEFAULT 'ready',
   dispatch_token TEXT,
   dispatch_until INTEGER,
-  message_id TEXT,
-  delivery INTEGER NOT NULL DEFAULT 0,
-  token TEXT,
-  error_json TEXT,
   created_at INTEGER NOT NULL,
-  finished_at INTEGER,
   UNIQUE (goal_id, step_name, iteration)
 );
 ALTER TABLE cfordo_attempts ADD COLUMN iteration_id INTEGER REFERENCES cfordo_iterations(id);
 ALTER TABLE cfordo_attempts ADD COLUMN delivery INTEGER;
+ALTER TABLE cfordo_attempts ADD COLUMN dispatch_token TEXT;
 DROP INDEX cfordo_attempts_first_action;
 DROP INDEX cfordo_attempts_next_action;
 CREATE UNIQUE INDEX cfordo_attempts_first_action
@@ -33,6 +29,9 @@ CREATE UNIQUE INDEX cfordo_attempts_first_action
 CREATE UNIQUE INDEX cfordo_attempts_next_action
   ON cfordo_attempts(predecessor_id)
   WHERE iteration_id IS NULL AND predecessor_id IS NOT NULL;
-CREATE UNIQUE INDEX cfordo_attempts_delivery_action
-  ON cfordo_attempts(iteration_id, delivery, action)
-  WHERE iteration_id IS NOT NULL;
+-- Append an action-less row when an execution finishes or the DLQ reports failure.
+-- predecessor_id points to its final phase, and the new row ID records persistence order.
+-- Legacy action-less rows have no iteration_id and are not final execution records.
+CREATE INDEX cfordo_attempts_iteration_results
+  ON cfordo_attempts(iteration_id, id)
+  WHERE iteration_id IS NOT NULL AND action IS NULL;
