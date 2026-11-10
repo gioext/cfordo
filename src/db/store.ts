@@ -5,37 +5,32 @@ import type {
   AttemptStatus,
   CheckResult,
   DatabaseBinding,
+  DatabaseResult,
   Goal,
   GoalStatus,
   JsonValue,
-  Iteration,
-  IterationResult,
 } from "../types.ts";
+import { DatabaseError, query } from "./query.ts";
+import { tables } from "./schema.ts";
 
 interface GoalRow {
   id: number;
   input_json: string;
   status: GoalStatus;
-  error_json: string | null;
   created_at: number;
-  expires_at: number;
   finished_at: number | null;
 }
 interface AttemptRow {
   id: number;
-  iteration_id: number | null;
-  iteration: number | null;
-  delivery: number | null;
-  dispatch_token: string | null;
   goal_id: number;
   step_name: string;
   action: Action | null;
   predecessor_id: number | null;
-  source_run_id: number | null;
-  status: AttemptStatus;
+  delivery_id: number;
+  run_id: number | null;
+  run_created_at: number | null;
+  status: AttemptStatus | null;
   output_json: string | null;
-  validation_json: string | null;
-  evaluation_json: string | null;
   error_json: string | null;
   created_at: number;
   finished_at: number | null;
@@ -45,426 +40,330 @@ function goal(row: GoalRow): Goal {
     id: row.id,
     input: JSON.parse(row.input_json),
     status: row.status,
-    error: row.error_json === null ? null : JSON.parse(row.error_json),
     createdAt: row.created_at,
-    expiresAt: row.expires_at,
     finishedAt: row.finished_at,
   };
 }
 function attempt(row: AttemptRow): Attempt {
   return {
     id: row.id,
-    iterationId: row.iteration_id,
-    iteration: row.iteration,
-    delivery: row.delivery,
-    dispatchToken: row.dispatch_token,
     goalId: row.goal_id,
     stepName: row.step_name,
     action: row.action,
     predecessorId: row.predecessor_id,
-    sourceRunId: row.source_run_id,
+    deliveryId: row.delivery_id,
+    runId: row.run_id,
+    runCreatedAt: row.run_created_at,
     status: row.status,
     output: row.output_json === null ? undefined : JSON.parse(row.output_json),
-    validation:
-      row.validation_json === null ? null : JSON.parse(row.validation_json),
-    evaluation:
-      row.evaluation_json === null ? null : JSON.parse(row.evaluation_json),
     error: row.error_json === null ? null : JSON.parse(row.error_json),
     createdAt: row.created_at,
     finishedAt: row.finished_at,
   };
 }
-
+function checked<Row>(result: DatabaseResult<Row>): DatabaseResult<Row> {
+  if (!result.success)
+    throw new DatabaseError(result.error || "Database operation failed");
+  return result;
+}
 export class GoalNotFoundError extends Error {
   constructor(id: number) {
     super(`Goal ${id} not found`);
   }
 }
+export class ExecutionStopped extends Error {}
+
+// Ownership, delivery and run identity have one stored source: the root and its links.
+const tree = `WITH RECURSIVE history AS (
+  SELECT id, goal_id, step_name, action, predecessor_id, status, output_json,
+    error_json, created_at, finished_at, id AS delivery_id,
+    NULL AS run_id, NULL AS run_created_at
+  FROM ${tables.attempts} WHERE predecessor_id IS NULL
+  UNION ALL
+  SELECT a.id, h.goal_id, h.step_name, a.action, a.predecessor_id, a.status,
+    a.output_json, a.error_json, a.created_at, a.finished_at,
+    CASE WHEN a.action IS NULL THEN a.id ELSE h.delivery_id END,
+    CASE WHEN a.action IS NULL THEN NULL WHEN a.action='run' THEN a.id ELSE h.run_id END,
+    CASE WHEN a.action IS NULL THEN NULL WHEN a.action='run' THEN a.created_at ELSE h.run_created_at END
+  FROM ${tables.attempts} a JOIN history h ON a.predecessor_id=h.id
+)`;
+export const DELIVERY_TIMEOUT = 60_000;
+export const EXECUTION_TIMEOUT = 15 * 60_000;
+const currentDelivery = `NOT EXISTS (SELECT 1 FROM ${tables.attempts} d
+  WHERE d.predecessor_id=h.delivery_id AND d.action IS NULL)`;
+const activeExecution = `EXISTS (SELECT 1 FROM history h JOIN ${tables.goals} g ON g.id=h.goal_id
+  WHERE h.id=a.id AND g.status='running' AND g.created_at+?>?
+  AND h.run_created_at+${EXECUTION_TIMEOUT}>? AND ${currentDelivery})`;
 
 export async function insertGoal(
   db: DatabaseBinding,
   input: JsonValue,
-  expiresIn: number,
-  now = Date.now(),
 ): Promise<Goal> {
-  const row = await db
-    .prepare(
-      `INSERT INTO cfordo_goals
-    (input_json, created_at, expires_at) VALUES (?, ?, ?) RETURNING *`,
-    )
-    .bind(JSON.stringify(input), now, now + expiresIn)
-    .first<GoalRow>();
+  const row = await query(
+    db
+      .prepare(
+        `INSERT INTO ${tables.goals}
+    (input_json,created_at) VALUES (?,?) RETURNING *`,
+      )
+      .bind(JSON.stringify(input), Date.now())
+      .first<GoalRow>(),
+  );
   if (!row) throw new Error("Goal creation failed");
   return goal(row);
 }
-
-export async function listPendingGoals(
-  db: DatabaseBinding,
-  now = Date.now(),
-): Promise<Goal[]> {
-  const result = await db
-    .prepare(
-      "SELECT * FROM cfordo_goals WHERE status IN ('ready', 'running') AND expires_at > ? ORDER BY id",
-    )
-    .bind(now)
-    .all<GoalRow>();
-  if (!result.success)
-    throw new Error(result.error || "Pending Goal query failed");
+export async function listPendingGoals(db: DatabaseBinding): Promise<Goal[]> {
+  const result = checked(
+    await query(
+      db
+        .prepare(
+          `SELECT * FROM ${tables.goals}
+    WHERE status IN ('ready','running') ORDER BY id`,
+        )
+        .all<GoalRow>(),
+    ),
+  );
   return (result.results ?? []).map(goal);
 }
-
 export async function listGoals(db: DatabaseBinding): Promise<Goal[]> {
-  const result = await db
-    .prepare("SELECT * FROM cfordo_goals ORDER BY id DESC")
-    .all<GoalRow>();
-  if (!result.success) throw new Error(result.error || "Goal query failed");
-  return (result.results ?? []).map(goal);
+  return (
+    checked(
+      await query(
+        db
+          .prepare(`SELECT * FROM ${tables.goals} ORDER BY id DESC`)
+          .all<GoalRow>(),
+      ),
+    ).results ?? []
+  ).map(goal);
 }
-
-const attemptQuery = `SELECT a.*, i.iteration FROM cfordo_attempts a
-  LEFT JOIN cfordo_iterations i ON i.id = a.iteration_id`;
-
-export async function listAllAttempts(db: DatabaseBinding): Promise<Attempt[]> {
-  const result = await db
-    .prepare(`${attemptQuery} WHERE a.action IS NOT NULL ORDER BY a.id`)
-    .all<AttemptRow>();
-  if (!result.success)
-    throw new Error(result.error || "Execution query failed");
-  return (result.results ?? []).map(attempt);
-}
-
 export async function getGoal(db: DatabaseBinding, id: number): Promise<Goal> {
-  const row = await db
-    .prepare("SELECT * FROM cfordo_goals WHERE id = ?")
-    .bind(id)
-    .first<GoalRow>();
+  const row = await query(
+    db
+      .prepare(`SELECT * FROM ${tables.goals} WHERE id=?`)
+      .bind(id)
+      .first<GoalRow>(),
+  );
   if (!row) throw new GoalNotFoundError(id);
   return goal(row);
 }
 export async function updateGoal(
   db: DatabaseBinding,
   id: number,
-  status: "running" | "completed" | "failed",
-  error?: AttemptError,
+  status: Exclude<GoalStatus, "ready">,
+  expiresIn: number,
   now = Date.now(),
 ): Promise<void> {
-  const result = await db
-    .prepare(
-      `UPDATE cfordo_goals SET status = ?, finished_at = ?, error_json = ?
-    WHERE id = ? AND status IN ('ready', 'running') AND expires_at > ?`,
-    )
-    .bind(
-      status,
-      status === "running" ? null : now,
-      error ? JSON.stringify(error) : null,
-      id,
-      now,
-    )
-    .run();
-  if (!result.success) throw new Error(result.error || "Goal update failed");
+  checked(
+    await query(
+      db
+        .prepare(
+          `UPDATE ${tables.goals} SET status=?,finished_at=?
+    WHERE id=? AND status IN ('ready','running') AND created_at+? ${status === "expired" ? "<=" : ">"} ?`,
+        )
+        .bind(status, status === "running" ? null : now, id, expiresIn, now)
+        .run(),
+    ),
+  );
 }
-
+export async function listAttempts(
+  db: DatabaseBinding,
+  goalId?: number,
+): Promise<Attempt[]> {
+  const result = checked(
+    await query(
+      db
+        .prepare(
+          `${tree} SELECT * FROM history
+    ${goalId === undefined ? "" : "WHERE goal_id=?"} ORDER BY id`,
+        )
+        .bind(...(goalId === undefined ? [] : [goalId]))
+        .all<AttemptRow>(),
+    ),
+  );
+  return (result.results ?? []).map(attempt);
+}
 export async function getAttempt(
   db: DatabaseBinding,
   id: number,
 ): Promise<Attempt> {
-  const row = await db
-    .prepare(`${attemptQuery} WHERE a.id = ?`)
-    .bind(id)
-    .first<AttemptRow>();
+  const row = await query(
+    db
+      .prepare(`${tree} SELECT * FROM history WHERE id=?`)
+      .bind(id)
+      .first<AttemptRow>(),
+  );
   if (!row) throw new Error(`Action execution ${id} not found`);
   return attempt(row);
 }
-export async function listAttempts(
-  db: DatabaseBinding,
-  goalId: number,
-  stepName?: string,
-): Promise<Attempt[]> {
-  const statement =
-    stepName === undefined
-      ? db
-          .prepare(
-            `${attemptQuery} WHERE a.goal_id = ? AND a.action IS NOT NULL ORDER BY a.id`,
-          )
-          .bind(goalId)
-      : db
-          .prepare(
-            `${attemptQuery} WHERE a.goal_id = ? AND a.step_name = ? AND a.action IS NOT NULL ORDER BY a.id`,
-          )
-          .bind(goalId, stepName);
-  const result = await statement.all<AttemptRow>();
-  if (!result.success) throw new Error(result.error || "Action query failed");
-  return (result.results ?? []).map(attempt);
-}
-interface IterationRow {
-  id: number;
-  goal_id: number;
-  step_name: string;
-  iteration: number;
-  dispatch_status: Iteration["dispatchStatus"];
-  created_at: number;
-}
-function iteration(row: IterationRow): Iteration {
-  return {
-    id: row.id,
-    goalId: row.goal_id,
-    stepName: row.step_name,
-    iteration: row.iteration,
-    dispatchStatus: row.dispatch_status,
-    createdAt: row.created_at,
-  };
-}
-export class ExecutionStopped extends Error {}
 
-export async function listIterationResults(
-  db: DatabaseBinding,
-  goalId?: number,
-): Promise<IterationResult[]> {
-  // Final records share the history table. Legacy action-less rows have no iteration.
-  const query = `SELECT id, iteration_id, predecessor_id AS attempt_id, error_json, finished_at
-    FROM cfordo_attempts WHERE iteration_id IS NOT NULL AND action IS NULL`;
-  const result = await db
-    .prepare(
-      query + (goalId === undefined ? "" : " AND goal_id = ?") + " ORDER BY id",
-    )
-    .bind(...(goalId === undefined ? [] : [goalId]))
-    .all<{
-      id: number;
-      iteration_id: number;
-      attempt_id: number | null;
-      error_json: string | null;
-      finished_at: number;
-    }>();
-  if (!result.success)
-    throw new Error(result.error || "Iteration result query failed");
-  return (result.results ?? []).map((row) => ({
-    id: row.id,
-    iterationId: row.iteration_id,
-    attemptId: row.attempt_id,
-    error: row.error_json === null ? null : JSON.parse(row.error_json),
-    finishedAt: row.finished_at,
-  }));
-}
-
-export async function listIterations(
-  db: DatabaseBinding,
-  goalId?: number,
-  stepName?: string,
-): Promise<Iteration[]> {
-  let query = "SELECT * FROM cfordo_iterations";
-  const bindings: (number | string)[] = [];
-  if (goalId !== undefined) {
-    query += " WHERE goal_id = ?";
-    bindings.push(goalId);
-  }
-  if (stepName !== undefined) {
-    query += " AND step_name = ?";
-    bindings.push(stepName);
-  }
-  const result = await db
-    .prepare(query + " ORDER BY id")
-    .bind(...bindings)
-    .all<IterationRow>();
-  if (!result.success)
-    throw new Error(result.error || "Iteration query failed");
-  return (result.results ?? []).map(iteration);
-}
-export async function getIteration(
-  db: DatabaseBinding,
-  id: number,
-): Promise<Iteration> {
-  const row = await db
-    .prepare("SELECT * FROM cfordo_iterations WHERE id = ?")
-    .bind(id)
-    .first<IterationRow>();
-  if (!row) throw new Error(`Iteration ${id} not found`);
-  return iteration(row);
-}
-export async function ensureIteration(
+// The planner chooses improvement or recovery. These predicates commit that decision
+// only while the observed delivery/execution is still current.
+export async function reserveDispatch(
   db: DatabaseBinding,
   goalId: number,
   stepName: string,
-  number: number,
-): Promise<void> {
+  delivery: Attempt | undefined,
+  last: Attempt | undefined,
+  recover: boolean,
+  expiresIn: number,
+): Promise<number | null> {
   const now = Date.now();
-  const result = await db
-    .prepare(
-      `INSERT INTO cfordo_iterations (goal_id, step_name, iteration, created_at)
-    SELECT id, ?, ?, ? FROM cfordo_goals WHERE id = ? AND status = 'running' AND expires_at > ?
-    ON CONFLICT DO NOTHING`,
-    )
-    .bind(stepName, number, now, goalId, now)
-    .run();
-  if (!result.success)
-    throw new Error(result.error || "Iteration creation failed");
+  if (!delivery) {
+    const result = checked(
+      await query(
+        db
+          .prepare(
+            `INSERT INTO ${tables.attempts}
+      (goal_id,step_name,created_at) SELECT id,?,? FROM ${tables.goals}
+      WHERE id=? AND status='running' AND created_at+?>?
+      ON CONFLICT DO NOTHING RETURNING id`,
+          )
+          .bind(stepName, now, goalId, expiresIn, now)
+          .all<{ id: number }>(),
+      ),
+    );
+    return result.results?.[0]?.id ?? null;
+  }
+  const statements = [];
+  if (recover && last) {
+    statements.push(
+      db
+        .prepare(
+          `${tree} UPDATE ${tables.attempts} AS a SET status='expired',finished_at=?
+      WHERE a.id=? AND a.status='running' AND EXISTS
+      (SELECT 1 FROM history h JOIN ${tables.goals} g ON g.id=h.goal_id
+       WHERE h.id=a.id AND g.status='running' AND g.created_at+?>?
+       AND h.run_created_at+${EXECUTION_TIMEOUT}<=? AND ${currentDelivery})`,
+        )
+        .bind(now, last.id, expiresIn, now, now),
+    );
+  }
+  const condition = last
+    ? `EXISTS (SELECT 1 FROM history h WHERE h.id=? AND h.delivery_id=d.id
+        AND h.status='${recover ? "expired" : "completed"}'
+        ${recover ? `AND h.run_created_at+${EXECUTION_TIMEOUT}<=?` : "AND h.action IN ('validate','evaluate') AND json_extract(h.output_json,'$.ok')=0"}
+        AND NOT EXISTS (SELECT 1 FROM ${tables.attempts} n WHERE n.predecessor_id=h.id AND n.action IS NOT NULL))`
+    : `d.created_at+${DELIVERY_TIMEOUT}<=? AND NOT EXISTS
+       (SELECT 1 FROM ${tables.attempts} r WHERE r.predecessor_id=d.id AND r.action='run')`;
+  statements.push(
+    db
+      .prepare(
+        `${tree} INSERT INTO ${tables.attempts} (predecessor_id,created_at)
+    SELECT d.id,? FROM history d JOIN ${tables.goals} g ON g.id=d.goal_id
+    WHERE d.id=? AND d.action IS NULL AND g.status='running' AND g.created_at+?>?
+    AND ${condition} ON CONFLICT DO NOTHING RETURNING id`,
+      )
+      .bind(
+        now,
+        delivery.id,
+        expiresIn,
+        now,
+        ...(last ? [last.id, ...(recover ? [now] : [])] : [now]),
+      ),
+  );
+  const results = await query(db.batch<{ id: number }>(statements));
+  results.forEach(checked);
+  return results.at(-1)!.results?.[0]?.id ?? null;
 }
 
-// Only an interrupted/failed send is eligible for another dispatch. Queued and running work is never resent by Cron.
-export async function reserveDispatch(
+export async function claimDelivery(
   db: DatabaseBinding,
-  id: number,
-  token: string,
-): Promise<boolean> {
+  deliveryId: number,
+  startedAt: number,
+  expiresIn: number,
+): Promise<Attempt | null> {
   const now = Date.now();
-  const result = await db
-    .prepare(
-      `UPDATE cfordo_iterations SET dispatch_status='sending', dispatch_token=?, dispatch_until=?
-    WHERE id=? AND (dispatch_status='ready' OR (dispatch_status='sending' AND dispatch_until <= ?))
-    AND EXISTS (SELECT 1 FROM cfordo_goals g WHERE g.id=goal_id AND g.status='running' AND g.expires_at>?)`,
-    )
-    .bind(token, now + 60_000, id, now, now)
-    .run();
-  if (!result.success)
-    throw new Error(result.error || "Dispatch reservation failed");
-  return result.meta.changes === 1;
+  const result = checked(
+    await query(
+      db
+        .prepare(
+          `${tree} INSERT INTO ${tables.attempts}
+    (action,predecessor_id,status,created_at)
+    SELECT 'run',h.id,'running',? FROM history h JOIN ${tables.goals} g ON g.id=h.goal_id
+    WHERE h.id=? AND h.action IS NULL AND g.status='running' AND g.created_at+?>?
+    AND h.created_at+${DELIVERY_TIMEOUT}>? AND ?+${EXECUTION_TIMEOUT}>? AND ${currentDelivery}
+    ON CONFLICT DO NOTHING RETURNING id`,
+        )
+        .bind(startedAt, deliveryId, expiresIn, now, now, startedAt, now)
+        .all<{ id: number }>(),
+    ),
+  );
+  const row = result.results?.[0];
+  return row ? getAttempt(db, row.id) : null;
 }
-export async function finishDispatch(
-  db: DatabaseBinding,
-  id: number,
-  token: string,
-  sent: boolean,
-): Promise<void> {
-  const result = await db
-    .prepare(
-      `UPDATE cfordo_iterations SET dispatch_status=?, dispatch_until=NULL
-    WHERE id=? AND dispatch_status='sending' AND dispatch_token=?`,
-    )
-    .bind(sent ? "queued" : "ready", id, token)
-    .run();
-  if (!result.success)
-    throw new Error(result.error || "Dispatch update failed");
-}
-export async function beginAttempt(
-  db: DatabaseBinding,
-  round: Iteration,
-  dispatchToken: string,
-  delivery: number,
-  action: Action,
-  sourceRunId: number | null,
-  predecessorId: number | null,
-): Promise<Attempt> {
-  const now = Date.now();
-  const row = await db
-    .prepare(
-      `INSERT INTO cfordo_attempts
-    (goal_id,step_name,worker_name,action,predecessor_id,source_run_id,status,created_at,iteration_id,delivery,dispatch_token)
-    SELECT goal_id,step_name,step_name,?,?,?,'running',?,id,?,? FROM cfordo_iterations
-    WHERE id=? AND EXISTS (SELECT 1 FROM cfordo_goals g WHERE g.id=goal_id AND g.expires_at>?) RETURNING id`,
-    )
-    .bind(
-      action,
-      predecessorId,
-      sourceRunId,
-      now,
-      delivery,
-      dispatchToken,
-      round.id,
-      now,
-    )
-    .first<{ id: number }>();
-  if (!row) throw new ExecutionStopped("Goal has expired");
-  return getAttempt(db, row.id);
-}
-const outcomeColumns = {
-  run: "output_json",
-  validate: "validation_json",
-  evaluate: "evaluation_json",
-} as const;
 export async function saveOutcome(
   db: DatabaseBinding,
-  attempt: Attempt,
+  item: Attempt,
   value: JsonValue | CheckResult,
+  expiresIn: number,
 ): Promise<void> {
-  if (!attempt.action) throw new Error("Action missing");
-  const result = await db
-    .prepare(
-      `UPDATE cfordo_attempts SET ${outcomeColumns[attempt.action]}=?
-    WHERE id=? AND status='running'`,
-    )
-    .bind(JSON.stringify(value), attempt.id)
-    .run();
-  if (!result.success) throw new Error(result.error || "Outcome save failed");
-  if (result.meta.changes !== 1) throw new Error("Action is no longer running");
+  const now = Date.now();
+  const result = checked(
+    await query(
+      db
+        .prepare(
+          `${tree} UPDATE ${tables.attempts} AS a SET output_json=?
+    WHERE a.id=? AND a.status='running' AND ${activeExecution}`,
+        )
+        .bind(JSON.stringify(value), item.id, expiresIn, now, now)
+        .run(),
+    ),
+  );
+  if (result.meta.changes !== 1)
+    throw new ExecutionStopped("Execution is no longer active");
 }
+// Completing a nonfinal phase and creating its successor are atomic, so a stopped
+// execution always leaves either a final outcome or an unfinished phase to expire.
 export async function finishAttempt(
   db: DatabaseBinding,
-  attempt: Attempt,
-): Promise<void> {
-  const result = await db
-    .prepare(
-      `UPDATE cfordo_attempts SET status='completed', finished_at=?
-    WHERE id=? AND status='running' AND ${outcomeColumns[attempt.action!]} IS NOT NULL`,
-    )
-    .bind(Date.now(), attempt.id)
-    .run();
-  if (!result.success)
-    throw new Error(result.error || "Action completion failed");
-  if (result.meta.changes !== 1)
-    throw new Error("Action has no saved outcome or has already ended");
-}
-
-export async function saveIterationResult(
-  db: DatabaseBinding,
-  iterationId: number,
-  attemptId: number | null,
-  error?: AttemptError,
-): Promise<void> {
-  // Append after the execution ends: this ID records final persistence order.
-  // action=NULL keeps the record out of the public run/validate/evaluate history.
+  item: Attempt,
+  next: Action | null,
+  expiresIn: number,
+): Promise<Attempt | null> {
   const now = Date.now();
-  const result = await db
-    .prepare(
-      `INSERT INTO cfordo_attempts
-      (goal_id,step_name,worker_name,iteration_id,predecessor_id,status,error_json,created_at,finished_at)
-      SELECT goal_id,step_name,step_name,id,?,?,?,?,? FROM cfordo_iterations WHERE id=?`,
-    )
-    .bind(
-      attemptId,
-      error ? "failed" : "completed",
-      error ? JSON.stringify(error) : null,
-      now,
-      now,
-      iterationId,
-    )
-    .run();
-  if (!result.success)
-    throw new Error(result.error || "Iteration result save failed");
-  if (result.meta.changes !== 1)
-    throw new Error("Iteration missing while saving its result");
+  const statements = [];
+  if (next)
+    statements.push(
+      db
+        .prepare(
+          `${tree} INSERT INTO ${tables.attempts}
+    (action,predecessor_id,status,created_at)
+    SELECT ?,a.id,'running',? FROM ${tables.attempts} a WHERE a.id=? AND a.status='running'
+    AND a.output_json IS NOT NULL AND ${activeExecution} RETURNING id`,
+        )
+        .bind(next, now, item.id, expiresIn, now, now),
+    );
+  statements.push(
+    db
+      .prepare(
+        `${tree} UPDATE ${tables.attempts} AS a SET status='completed',finished_at=?
+    WHERE a.id=? AND a.status='running' AND a.output_json IS NOT NULL AND ${activeExecution}`,
+      )
+      .bind(now, item.id, expiresIn, now, now),
+  );
+  const results = await query(db.batch<{ id: number }>(statements));
+  results.forEach(checked);
+  if (results.at(-1)!.meta.changes !== 1)
+    throw new ExecutionStopped("Execution is no longer active");
+  return next ? getAttempt(db, results[0].results![0].id) : null;
 }
-
 export async function failAttempt(
   db: DatabaseBinding,
-  attempt: Attempt,
+  item: Attempt,
   error: AttemptError,
+  expiresIn: number,
 ): Promise<void> {
-  const result = await db
-    .prepare(
-      `UPDATE cfordo_attempts SET status='failed',error_json=?,finished_at=?
-      WHERE id=? AND status='running'`,
-    )
-    .bind(JSON.stringify(error), Date.now(), attempt.id)
-    .run();
-  if (!result.success)
-    throw new Error(result.error || "Action failure save failed");
-}
-
-export async function exhaustIteration(
-  db: DatabaseBinding,
-  round: Iteration,
-  dispatchToken: string,
-): Promise<void> {
-  const history = await listAttempts(db, round.goalId, round.stepName);
-  const last = history
-    .filter(
-      (a) => a.iterationId === round.id && a.dispatchToken === dispatchToken,
-    )
-    .at(-1);
-  await saveIterationResult(db, round.id, last?.id ?? null, {
-    source: "queue",
-    name: "QueueRetriesExhausted",
-    message: last?.error
-      ? `Queue retries exhausted: ${last.error.message}`
-      : "Queue retries exhausted before the iteration completed",
-  });
+  const now = Date.now();
+  const result = checked(
+    await query(
+      db
+        .prepare(
+          `${tree} UPDATE ${tables.attempts} AS a
+    SET status='failed',error_json=?,finished_at=? WHERE a.id=? AND a.status='running' AND ${activeExecution}`,
+        )
+        .bind(JSON.stringify(error), now, item.id, expiresIn, now, now)
+        .run(),
+    ),
+  );
+  if (result.meta.changes !== 1)
+    throw new ExecutionStopped("Execution is no longer active");
 }

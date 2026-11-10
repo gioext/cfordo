@@ -1,10 +1,12 @@
 export type JsonValue =
   null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
-export type GoalStatus = "ready" | "running" | "completed" | "failed";
-export type EffectiveGoalStatus = GoalStatus | "expired";
+export type GoalStatus =
+  "ready" | "running" | "completed" | "failed" | "expired";
+export type EffectiveGoalStatus = GoalStatus;
 export type Action = "run" | "validate" | "evaluate";
 export type CheckSource = Exclude<Action, "run">;
-export type AttemptStatus = "ready" | "running" | "completed" | "failed";
+export type AttemptStatus =
+  "ready" | "running" | "completed" | "failed" | "expired";
 
 export interface OrdoContext<
   Params = any,
@@ -75,10 +77,10 @@ export interface ImprovementFeedback {
 }
 
 export interface OrdoOptions {
-  /** Name of the native dead-letter queue consumed by this Worker. */
-  deadLetterQueue: string;
-  /** Goal lifetime in milliseconds; defaults to 24 hours. */
+  /** Goal lifetime in milliseconds; defaults to 24 hours and applies to unfinished Goals. */
   expiresIn?: number;
+  /** Maximum iterations per step including the initial run; defaults to 3. */
+  maxIterations?: number;
 }
 
 export interface OrdoRegistration<Params = any, Env extends OrdoEnv = OrdoEnv> {
@@ -94,15 +96,13 @@ export type CheckResult = { ok: true } | { ok: false; reason: string };
 export interface Goal {
   id: number;
   input: JsonValue;
-  error: AttemptError | null;
   status: GoalStatus;
   createdAt: number;
-  expiresAt: number;
   finishedAt: number | null;
 }
 
 export type ErrorSource =
-  "run" | CheckSource | "dispatch" | "configuration" | "queue";
+  "run" | CheckSource | "dispatch" | "configuration" | "execution";
 export interface AttemptError {
   source: ErrorSource;
   name: string;
@@ -110,39 +110,18 @@ export interface AttemptError {
   stack?: string;
 }
 
-export interface Iteration {
-  id: number;
-  goalId: number;
-  stepName: string;
-  iteration: number;
-  dispatchStatus: "ready" | "sending" | "queued";
-  createdAt: number;
-}
-
-/** Projection of a final execution record in the shared history table. */
-export interface IterationResult {
-  id: number;
-  iterationId: number;
-  attemptId: number | null;
-  error: AttemptError | null;
-  finishedAt: number;
-}
-
+/** IDs and ownership below are derived from the predecessor chain on reads. */
 export interface Attempt {
   id: number;
-  iterationId: number | null;
-  iteration: number | null;
-  delivery: number | null;
-  dispatchToken: string | null;
   goalId: number;
   stepName: string;
   action: Action | null;
   predecessorId: number | null;
-  sourceRunId: number | null;
-  status: AttemptStatus;
+  deliveryId: number;
+  runId: number | null;
+  runCreatedAt: number | null;
+  status: AttemptStatus | null;
   output: JsonValue | undefined;
-  validation: CheckResult | null;
-  evaluation: CheckResult | null;
   error: AttemptError | null;
   createdAt: number;
   finishedAt: number | null;
@@ -156,9 +135,9 @@ export type RegisteredStep<Env extends OrdoEnv = any> = StepDefinition<
 export type Playbook<Env extends OrdoEnv = OrdoEnv> =
   readonly (readonly RegisteredStep<Env>[])[];
 export interface Intent {
-  protocol: "cfordo/3";
-  iterationId: number;
-  dispatchToken: string;
+  protocol: "cfordo/7";
+  schemaVersion: number;
+  deliveryId: number;
 }
 
 /** HTTP responses. Execution history is present only on the detail endpoint. */
@@ -168,8 +147,7 @@ export interface ErrorInfo {
 }
 export interface ExecutionDetail {
   attemptId: number;
-  iteration?: number;
-  delivery?: number;
+  iteration: number;
   action: Action;
   sourceRunId: number | null;
   status: AttemptStatus;

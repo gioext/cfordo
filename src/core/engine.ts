@@ -1,39 +1,30 @@
-import {
-  finishDispatch,
-  listAllAttempts,
-  listAttempts,
-  listIterationResults,
-  listIterations,
-  reserveDispatch,
-} from "../db/store.ts";
-import type { DatabaseBinding, Iteration, OrdoEnv } from "../types.ts";
+import { SCHEMA_VERSION } from "../db/schema.ts";
+import { reserveDispatch } from "../db/store.ts";
+import type { Attempt, OrdoEnv } from "../types.ts";
 
-export async function readResults(db: DatabaseBinding, goalId?: number) {
-  // Read final results first so each referenced action exists in the later history read.
-  const results = await listIterationResults(db, goalId);
-  const rounds = await listIterations(db, goalId);
-  const history =
-    goalId === undefined
-      ? await listAllAttempts(db)
-      : await listAttempts(db, goalId);
-  return { results, rounds, history };
-}
-
-export async function dispatchIteration(
+export async function dispatchStep(
   env: OrdoEnv,
-  round: Iteration,
+  goalId: number,
+  stepName: string,
+  delivery: Attempt | undefined,
+  last: Attempt | undefined,
+  recover: boolean,
+  expiresIn: number,
 ): Promise<void> {
-  const token = crypto.randomUUID();
-  if (!(await reserveDispatch(env.DB, round.id, token))) return;
-  try {
-    await env.QUEUE.send({
-      protocol: "cfordo/3",
-      iterationId: round.id,
-      dispatchToken: token,
-    });
-    await finishDispatch(env.DB, round.id, token, true);
-  } catch (error) {
-    await finishDispatch(env.DB, round.id, token, false);
-    throw error;
-  }
+  const id = await reserveDispatch(
+    env.DB,
+    goalId,
+    stepName,
+    delivery,
+    last,
+    recover,
+    expiresIn,
+  );
+  if (id === null) return;
+  // An ambiguous send leaves the recorded dispatch for the planner to recover.
+  await env.QUEUE.send({
+    protocol: "cfordo/7",
+    schemaVersion: SCHEMA_VERSION,
+    deliveryId: id,
+  });
 }

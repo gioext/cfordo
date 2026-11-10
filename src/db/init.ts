@@ -1,13 +1,9 @@
-import initial from "./migrations/0001_init.sql";
-import cronIterations from "./migrations/0002_cron_iterations.sql";
+import schema from "./schema.sql";
+import { SCHEMA_PREFIX } from "./schema.ts";
+import { DatabaseError, query } from "./query.ts";
 import type { DatabaseBinding } from "../types.ts";
 
-const migrations = [
-  { id: 1, sql: initial },
-  { id: 2, sql: cronIterations },
-];
-
-// Split our migration statements without splitting quoted values or comments.
+// Split the CREATE definitions without splitting quoted values or comments.
 function statements(sql: string): string[] {
   const result: string[] = [];
   let current = "";
@@ -42,49 +38,18 @@ function statements(sql: string): string[] {
       current += ch;
     }
   }
-  if (quote) throw new Error("Unterminated quote in migration");
+  if (quote) throw new Error("Unterminated quote in schema");
   if (current.trim()) result.push(current.trim());
   return result;
 }
 
-async function appliedVersions(db: DatabaseBinding): Promise<number[]> {
-  const table = await db
-    .prepare(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cfordo_schema_versions'",
-    )
-    .first();
-  if (!table) return [];
-  const result = await db
-    .prepare("SELECT id FROM cfordo_schema_versions ORDER BY id")
-    .all<{ id: number }>();
-  if (!result.success)
-    throw new Error(result.error || "Cannot read migration versions");
-  return (result.results ?? []).map((row) => row.id);
-}
+const definitions = statements(schema.replaceAll("{{prefix}}", SCHEMA_PREFIX));
 
 export async function initOrdo(db: DatabaseBinding): Promise<void> {
-  const applied = await appliedVersions(db);
-  if (applied.some((id, index) => migrations[index]?.id !== id)) {
-    throw new Error(
-      "The database has a migration version unsupported by this cfordo package",
-    );
-  }
-  for (const migration of migrations) {
-    if (applied.includes(migration.id)) continue;
-    try {
-      const results = await db.batch([
-        ...statements(migration.sql).map((sql) => db.prepare(sql)),
-        db
-          .prepare(
-            "INSERT INTO cfordo_schema_versions (id, applied_at) VALUES (?, ?)",
-          )
-          .bind(migration.id, Date.now()),
-      ]);
-      const failure = results.find((result) => !result.success);
-      if (failure) throw new Error(failure.error || "Migration failed");
-    } catch (error) {
-      // A concurrent initializer may have committed the same atomic migration.
-      if (!(await appliedVersions(db)).includes(migration.id)) throw error;
-    }
-  }
+  const results = await query(
+    db.batch(definitions.map((sql) => db.prepare(sql))),
+  );
+  const failure = results.find((result) => !result.success);
+  if (failure)
+    throw new DatabaseError(failure.error || "Schema creation failed");
 }

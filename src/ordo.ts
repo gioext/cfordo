@@ -26,7 +26,7 @@ export class Ordo<
   readonly fetch: ExportedHandlerFetchHandler<Env> = (request, env, ctx) =>
     this.app.fetch(request, env, ctx);
   readonly queue: ExportedHandlerQueueHandler<Env> = (batch, env) =>
-    this.definition.queue(batch, env);
+    this.definition.queue(batch, env, Date.now());
   readonly scheduled: ExportedHandlerScheduledHandler<Env> = (
     _controller,
     env,

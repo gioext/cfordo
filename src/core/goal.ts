@@ -1,5 +1,5 @@
 import { initOrdo } from "../db/init.ts";
-import { getGoal, insertGoal, listGoals } from "../db/store.ts";
+import { getGoal, insertGoal, listGoals, listAttempts } from "../db/store.ts";
 import type {
   EffectiveGoalStatus,
   Goal,
@@ -11,133 +11,114 @@ import type {
   GoalDetail,
   StepResult,
   ExecutionDetail,
-  Iteration,
-  IterationResult,
 } from "../types.ts";
 import { assertJson } from "./validation.ts";
-import { stepProgress } from "./progress.ts";
-import { readResults } from "./engine.ts";
+import { feedback, stepProgress, verdict } from "./progress.ts";
 
 export function getGoalStatus(
   goal: Goal,
+  expiresIn: number,
   now = Date.now(),
 ): EffectiveGoalStatus {
   return (goal.status === "ready" || goal.status === "running") &&
-    now >= goal.expiresAt
+    now >= goal.createdAt + expiresIn
     ? "expired"
     : goal.status;
 }
-
 export async function startGoal(
   db: DatabaseBinding,
   input: unknown,
-  expiresIn: number,
 ): Promise<number> {
   assertJson(input, "Goal input");
   await initOrdo(db);
-  return (await insertGoal(db, input, expiresIn)).id;
+  return (await insertGoal(db, input)).id;
 }
-
 function errorInfo(
   error: { name: string; message: string } | null,
 ): ErrorInfo | null {
   return error ? { code: error.name, message: error.message } : null;
 }
-
-function execution(attempt: Attempt): ExecutionDetail {
+function execution(
+  item: Attempt,
+  history: readonly Attempt[],
+): ExecutionDetail {
   return {
-    attemptId: attempt.id,
-    ...(attempt.iteration !== null
-      ? { iteration: attempt.iteration, delivery: attempt.delivery! }
-      : {}),
-    action: attempt.action!,
-    sourceRunId: attempt.sourceRunId,
-    status: attempt.status,
-    output: attempt.output ?? null,
-    verdict: attempt.validation ?? attempt.evaluation,
-    error: errorInfo(attempt.error),
-    createdAt: attempt.createdAt,
-    finishedAt: attempt.finishedAt,
+    attemptId: item.id,
+    iteration: feedback(history.filter((a) => a.id < item.deliveryId))
+      .iteration,
+    action: item.action!,
+    sourceRunId: item.action === "run" ? null : item.runId,
+    status: item.status!,
+    output: item.action === "run" ? (item.output ?? null) : null,
+    verdict: verdict(item),
+    error: errorInfo(item.error),
+    createdAt: item.createdAt,
+    finishedAt: item.finishedAt,
   };
 }
-
 function stepResult(
   name: string,
   history: Attempt[],
-  rounds: Iteration[],
-  results: IterationResult[],
   definition: RegisteredStep | undefined,
   goalStatus: EffectiveGoalStatus,
-  expiresAt: number,
+  maxIterations: number,
 ): StepResult {
-  const progress = stepProgress(history, rounds, results, definition);
-  const last = progress.execution.at(-1);
-  const run = progress.execution
-    .slice()
-    .reverse()
-    .find((item) => item.action === "run");
-  // Only checks of this run belong beside its output, including a retry of a check.
-  const checks = run
-    ? progress.execution.filter((item) => item.sourceRunId === run.id)
-    : [];
-  const validation = checks
-    .slice()
-    .reverse()
-    .find((item) => item.action === "validate");
-  const evaluation = checks
-    .slice()
-    .reverse()
-    .find((item) => item.action === "evaluate");
-  let { status, action } = progress as {
-    status: EffectiveGoalStatus;
-    action: StepResult["action"];
-  };
-  let error = errorInfo(progress.error);
+  const active = goalStatus === "ready" || goalStatus === "running";
+  // Historical outcomes do not reinterpret a failed Goal using today's improvement limit.
+  const progress = stepProgress(
+    history,
+    definition,
+    active ? maxIterations : Infinity,
+  );
+  const run = progress.execution.find((item) => item.action === "run");
+  const validation = progress.execution.find(
+    (item) => item.action === "validate",
+  );
+  const evaluation = progress.execution.find(
+    (item) => item.action === "evaluate",
+  );
+  let status: EffectiveGoalStatus = progress.status;
+  let action = progress.action;
+  let error = errorInfo(progress.last?.error ?? null);
+  let finishedAt = progress.finishedAt;
+  if (progress.rejected && (status === "failed" || goalStatus === "failed")) {
+    status = "failed";
+    error = { code: "CheckRejected", message: progress.rejected.reason };
+    finishedAt = progress.last!.finishedAt;
+  }
   if (
     status === "running" &&
     (goalStatus === "failed" || goalStatus === "expired")
-  ) {
-    status = goalStatus;
-    const verdict = last?.validation ?? last?.evaluation;
-    if (!error && verdict?.ok === false)
-      error = { code: "CheckRejected", message: verdict.reason };
-  }
-  if (
-    goalStatus === "expired" &&
-    (progress.finishedAt ?? last?.finishedAt) !== null &&
-    (progress.finishedAt ?? last?.finishedAt) !== undefined &&
-    (progress.finishedAt ?? last!.finishedAt!) >= expiresAt
   )
-    status = "expired";
-  if (status === "failed" || status === "expired") action = null;
+    status = goalStatus;
+  if (!active || status === "failed") action = null;
   return {
     stepName: name,
     status,
     action,
     output: run?.output ?? null,
-    validation: validation?.validation ?? null,
-    evaluation: evaluation?.evaluation ?? null,
+    validation: verdict(validation),
+    evaluation: verdict(evaluation),
     error,
-    createdAt: history[0]?.createdAt ?? null,
-    finishedAt: progress.finishedAt,
+    createdAt: history.find((item) => item.action !== null)?.createdAt ?? null,
+    finishedAt,
   };
 }
-
 export async function readResult<T>(
   db: DatabaseBinding,
   goalId: number,
   definition: RegisteredStep,
+  maxIterations: number,
+  expiresIn: number,
 ): Promise<T> {
   const goal = await getGoal(db, goalId);
-  const { history, rounds, results } = await readResults(db, goalId);
+  const history = await listAttempts(db, goalId);
   const result = stepResult(
     definition.name,
     history.filter((a) => a.stepName === definition.name),
-    rounds.filter((r) => r.stepName === definition.name),
-    results,
     definition,
-    getGoalStatus(goal),
-    goal.expiresAt,
+    getGoalStatus(goal, expiresIn),
+    maxIterations,
   );
   if (result.status !== "completed")
     throw new Error(
@@ -145,107 +126,88 @@ export async function readResult<T>(
     );
   return result.output as T;
 }
-
 function summary(
   goal: Goal,
-  status: EffectiveGoalStatus,
-  error: ErrorInfo | null,
   definitions: readonly RegisteredStep[],
   history: Attempt[],
-  rounds: Iteration[],
-  outcomes: IterationResult[],
+  maxIterations: number,
+  expiresIn: number,
 ): GoalSummary {
-  const byStep = new Map<string, Attempt[]>();
-  for (const item of history) {
-    const group = byStep.get(item.stepName) ?? [];
-    group.push(item);
-    byStep.set(item.stepName, group);
-  }
-  // Include registered steps that have not started and persisted steps from an older definition.
+  const status = getGoalStatus(goal, expiresIn);
   const names = new Set([
     ...definitions.map((item) => item.name),
-    ...byStep.keys(),
+    ...history.map((item) => item.stepName),
   ]);
   const results = [...names].map((name) =>
     stepResult(
       name,
-      byStep.get(name) ?? [],
-      rounds.filter((round) => round.stepName === name),
-      outcomes,
+      history.filter((a) => a.stepName === name),
       definitions.find((item) => item.name === name),
       status,
-      goal.expiresAt,
+      maxIterations,
     ),
   );
+  // Every cause comes from its execution row; no representative error is copied onto a Goal.
+  const causes = results
+    .filter((item) => item.error)
+    .map((item) => `${item.stepName}: ${item.error!.message}`);
+  const error =
+    status === "expired"
+      ? { code: "GoalExpired", message: "Goal expired" }
+      : status === "failed" && causes.length
+        ? { code: "GoalFailed", message: causes.join("; ") }
+        : null;
   return {
     goalId: goal.id,
     input: goal.input,
     status,
     createdAt: goal.createdAt,
-    expiresAt: goal.expiresAt,
+    expiresAt: goal.createdAt + expiresIn,
     finishedAt: goal.finishedAt,
-    error:
-      error ??
-      (status === "failed"
-        ? (results.find((item) => item.status === "failed" && item.error)
-            ?.error ?? null)
-        : null),
+    error,
     results,
   };
 }
-
 export async function readGoal(
   db: DatabaseBinding,
   definitions: readonly RegisteredStep[],
   id: number,
+  maxIterations: number,
+  expiresIn: number,
 ): Promise<GoalDetail> {
   await initOrdo(db);
   const goal = await getGoal(db, id);
-  const status = getGoalStatus(goal);
-  const error = errorInfo(goal.error);
-  const { history, rounds, results } = await readResults(db, id);
-  const result = summary(
-    goal,
-    status,
-    error,
-    definitions,
-    history,
-    rounds,
-    results,
-  );
+  const history = await listAttempts(db, id);
+  const result = summary(goal, definitions, history, maxIterations, expiresIn);
   return {
     ...result,
-    results: result.results.map((item) => ({
-      ...item,
-      executions: history
-        .filter((row) => row.stepName === item.stepName)
-        .map(execution),
-    })),
+    results: result.results.map((item) => {
+      const stepHistory = history.filter((a) => a.stepName === item.stepName);
+      return {
+        ...item,
+        executions: stepHistory
+          .filter((a) => a.action !== null)
+          .map((a) => execution(a, stepHistory)),
+      };
+    }),
   };
 }
-
 export async function readGoals(
   db: DatabaseBinding,
   definitions: readonly RegisteredStep[],
+  maxIterations: number,
+  expiresIn: number,
 ): Promise<GoalSummary[]> {
   await initOrdo(db);
   const goals = await listGoals(db);
-  const { history, rounds, results } = await readResults(db);
-  const byGoal = new Map<number, Attempt[]>();
-  for (const item of history) {
-    const group = byGoal.get(item.goalId) ?? [];
-    group.push(item);
-    byGoal.set(item.goalId, group);
-  }
+  const history = await listAttempts(db);
   return goals.map((goal) =>
     summary(
       goal,
-      getGoalStatus(goal),
-      errorInfo(goal.error),
       definitions,
-      byGoal.get(goal.id) ?? [],
-      rounds.filter((round) => round.goalId === goal.id),
-      results,
+      history.filter((a) => a.goalId === goal.id),
+      maxIterations,
+      expiresIn,
     ),
   );
 }

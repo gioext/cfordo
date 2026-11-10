@@ -1,11 +1,6 @@
-import {
-  ensureIteration,
-  getGoal,
-  listIterations,
-  updateGoal,
-} from "../db/store.ts";
+import { getGoal, listAttempts, updateGoal } from "../db/store.ts";
 import type { OrdoEnv, Playbook } from "../types.ts";
-import { dispatchIteration, readResults } from "./engine.ts";
+import { dispatchStep } from "./engine.ts";
 import { getGoalStatus } from "./goal.ts";
 import { stepProgress } from "./progress.ts";
 
@@ -13,52 +8,50 @@ export async function runPlanner<Env extends OrdoEnv>(
   env: Env,
   goalId: number,
   playbook: Playbook<Env>,
+  maxIterations: number,
+  expiresIn: number,
 ): Promise<void> {
   const goal = await getGoal(env.DB, goalId);
-  const status = getGoalStatus(goal);
-  if (status !== "ready" && status !== "running") return;
-  if (status === "ready") await updateGoal(env.DB, goalId, "running");
-  const { history, rounds, results } = await readResults(env.DB, goalId);
+  if (goal.status !== "ready" && goal.status !== "running") return;
+  if (getGoalStatus(goal, expiresIn) === "expired") {
+    await updateGoal(env.DB, goalId, "expired", expiresIn);
+    return;
+  }
+  if (goal.status === "ready")
+    await updateGoal(env.DB, goalId, "running", expiresIn);
+  const history = await listAttempts(env.DB, goalId);
   for (const group of playbook) {
     const steps = group.map((definition) => ({
       definition,
-      rounds: rounds.filter((r) => r.stepName === definition.name),
       progress: stepProgress(
         history.filter((a) => a.stepName === definition.name),
-        rounds.filter((r) => r.stepName === definition.name),
-        results,
         definition,
+        maxIterations,
       ),
     }));
-    const failed = steps.find((s) => s.progress.status === "failed");
-    if (failed) {
-      await updateGoal(
-        env.DB,
-        goalId,
-        "failed",
-        failed.progress.error ?? undefined,
-      );
+    if (steps.some((s) => s.progress.status === "failed")) {
+      await updateGoal(env.DB, goalId, "failed", expiresIn);
       return;
     }
     if (steps.every((s) => s.progress.status === "completed")) continue;
     const dispatched = await Promise.allSettled(
       steps
-        .filter((s) => s.progress.status !== "completed")
-        .map(async (s) => {
-          let round = s.rounds.at(-1);
-          if (!round || s.progress.result) {
-            const number = (round?.iteration ?? 0) + 1;
-            await ensureIteration(env.DB, goalId, s.definition.name, number);
-            round = (
-              await listIterations(env.DB, goalId, s.definition.name)
-            ).find((r) => r.iteration === number);
-          }
-          if (round) await dispatchIteration(env, round);
-        }),
+        .filter((s) => s.progress.dispatch)
+        .map((s) =>
+          dispatchStep(
+            env,
+            goalId,
+            s.definition.name,
+            s.progress.delivery,
+            s.progress.last,
+            s.progress.dispatch === "recover",
+            expiresIn,
+          ),
+        ),
     );
     const failure = dispatched.find((r) => r.status === "rejected");
     if (failure?.status === "rejected") throw failure.reason;
     return;
   }
-  await updateGoal(env.DB, goalId, "completed");
+  await updateGoal(env.DB, goalId, "completed", expiresIn);
 }

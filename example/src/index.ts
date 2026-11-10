@@ -4,7 +4,6 @@ type Params = { value: number };
 type Result = { value: number };
 
 const ordo = new Ordo<Env, Params>();
-ordo.configure({ deadLetterQueue: "example-ordo-queue-dlq" });
 
 await ordo.parallel(async () => {
   ordo.step<Result>({

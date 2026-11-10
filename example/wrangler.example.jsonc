@@ -21,13 +21,6 @@
         "max_batch_timeout": 0,
         "max_retries": 3,
         "retry_delay": 10,
-        "dead_letter_queue": "example-ordo-queue-dlq",
-      },
-      {
-        "queue": "example-ordo-queue-dlq",
-        "max_batch_timeout": 0,
-        "max_retries": 3,
-        "retry_delay": 10,
       },
     ],
   },

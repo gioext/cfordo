@@ -16,8 +16,8 @@ export class Definition<
   Env extends OrdoEnv,
   Params = any,
 > implements OrdoRegistration<Params, Env> {
-  private deadLetterQueue: string | undefined;
   private expiresIn = 24 * 60 * 60 * 1000;
+  private maxIterations = 3;
   private readonly steps = new Map<string, RegisteredStep<Env>>();
   private readonly playbook: RegisteredStep<Env>[][] = [];
   private group: RegisteredStep<Env>[] | null = null;
@@ -25,22 +25,44 @@ export class Definition<
 
   async start(env: Env, input: unknown): Promise<number> {
     this.ready(env);
-    return startGoal(env.DB, input, this.expiresIn);
+    return startGoal(env.DB, input);
   }
 
   async list(env: Env) {
     this.ready(env);
-    return readGoals(env.DB, this.playbook.flat());
+    return readGoals(
+      env.DB,
+      this.playbook.flat(),
+      this.maxIterations,
+      this.expiresIn,
+    );
   }
 
   async get(env: Env, id: number) {
     this.ready(env);
-    return readGoal(env.DB, this.playbook.flat(), id);
+    return readGoal(
+      env.DB,
+      this.playbook.flat(),
+      id,
+      this.maxIterations,
+      this.expiresIn,
+    );
   }
 
-  async queue(batch: MessageBatch<unknown>, env: Env): Promise<void> {
+  async queue(
+    batch: MessageBatch<unknown>,
+    env: Env,
+    startedAt: number,
+  ): Promise<void> {
     this.ready(env);
-    await consumeQueue(batch, env, this.steps, this.deadLetterQueue!);
+    await consumeQueue(
+      batch,
+      env,
+      this.steps,
+      startedAt,
+      this.maxIterations,
+      this.expiresIn,
+    );
   }
 
   async scheduled(env: Env): Promise<void> {
@@ -50,7 +72,13 @@ export class Definition<
     const failures: unknown[] = [];
     for (const goal of goals) {
       try {
-        await runPlanner(env, goal.id, this.playbook);
+        await runPlanner(
+          env,
+          goal.id,
+          this.playbook,
+          this.maxIterations,
+          this.expiresIn,
+        );
       } catch (error) {
         // A transient outage must neither fail the business Goal nor block other Goals.
         console.error("Ordo scheduling failed", { goalId: goal.id, error });
@@ -67,28 +95,27 @@ export class Definition<
       !options ||
       typeof options !== "object" ||
       Object.keys(options).some(
-        (key) => !["expiresIn", "deadLetterQueue"].includes(key),
+        (key) => !["expiresIn", "maxIterations"].includes(key),
       )
     ) {
       throw new TypeError(
-        "configure() only accepts expiresIn and deadLetterQueue",
+        "configure() only accepts expiresIn and maxIterations",
       );
     }
-    if (
-      typeof options.deadLetterQueue !== "string" ||
-      !options.deadLetterQueue.trim()
-    )
-      throw new TypeError(
-        "deadLetterQueue must name the native dead-letter queue",
-      );
-    this.deadLetterQueue = options.deadLetterQueue;
-    const expiresIn = options.expiresIn ?? 24 * 60 * 60 * 1000;
+    const expiresIn = options.expiresIn ?? this.expiresIn;
+    const maxIterations = options.maxIterations ?? this.maxIterations;
     if (!Number.isSafeInteger(expiresIn) || expiresIn <= 0) {
       throw new TypeError(
         "expiresIn must be a positive number of milliseconds",
       );
     }
+    if (!Number.isSafeInteger(maxIterations) || maxIterations <= 0) {
+      throw new TypeError(
+        "maxIterations must be a positive safe integer including the initial run",
+      );
+    }
     this.expiresIn = expiresIn;
+    this.maxIterations = maxIterations;
   }
 
   step<Result = any>(definition: StepDefinition<Params, Result, Env>): void {
@@ -127,10 +154,6 @@ export class Definition<
   }
 
   ready(env: Env): void {
-    if (!this.deadLetterQueue)
-      throw new Error(
-        "configure({ deadLetterQueue }) is required to record exhausted Queue deliveries",
-      );
     if (this.group)
       throw new Error("Await parallel registration before execution");
     if (

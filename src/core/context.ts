@@ -18,6 +18,8 @@ export function createContext<Env extends OrdoEnv>(
   params: JsonValue,
   feedback: ImprovementFeedback,
   definitions: ReadonlyMap<string, RegisteredStep<Env>>,
+  maxIterations: number,
+  expiresIn: number,
 ) {
   let current: Attempt;
   let result: JsonValue | undefined;
@@ -39,13 +41,19 @@ export function createContext<Env extends OrdoEnv>(
     async result<T = any>(name: string): Promise<T> {
       const definition = definitions.get(name);
       if (!definition) throw new Error(`Step not registered: ${name}`);
-      return readResult<T>(env.DB, goalId, definition);
+      return readResult<T>(
+        env.DB,
+        goalId,
+        definition,
+        maxIterations,
+        expiresIn,
+      );
     },
     async complete(value: unknown): Promise<void> {
       if (current.action !== "run")
         throw new TypeError("complete() is only available to run");
       assertJson(value, "Business result");
-      await saveOutcome(env.DB, current, value);
+      await saveOutcome(env.DB, current, value, expiresIn);
       saved = true;
     },
     async ok(): Promise<void> {
@@ -53,7 +61,7 @@ export function createContext<Env extends OrdoEnv>(
         throw new TypeError("ok() does not accept arguments");
       if (current.action !== "validate" && current.action !== "evaluate")
         throw new TypeError("ok() is only available to checks");
-      await saveOutcome(env.DB, current, { ok: true });
+      await saveOutcome(env.DB, current, { ok: true }, expiresIn);
       saved = true;
     },
     async ng(reason: string): Promise<void> {
@@ -65,7 +73,7 @@ export function createContext<Env extends OrdoEnv>(
         throw new TypeError("ng() requires one non-empty reason");
       if (current.action !== "validate" && current.action !== "evaluate")
         throw new TypeError("ng() is only available to checks");
-      await saveOutcome(env.DB, current, { ok: false, reason });
+      await saveOutcome(env.DB, current, { ok: false, reason }, expiresIn);
       saved = true;
     },
   });

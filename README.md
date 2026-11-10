@@ -2,24 +2,21 @@
 
 [日本語](README.ja.md)
 
-## Purpose
+A TypeScript library for jobs combining execution, validation, and evaluation on Cloudflare Workers, Queues, and D1.
 
-A TypeScript framework for predefined jobs on Cloudflare Cron Triggers, Queues, and D1.
-Each Queue invocation executes one improvement iteration: run, validate, then evaluate. D1 stores input, results, verdicts, iterations, and progress.
-Each dedicated Worker hosts one Ordo with its own D1 and Queue. Access its HTTP API over a private service binding; no public URL is required.
+## Install
 
-Changing steps during execution, AI-generated steps, and deployment outside Cloudflare are out of scope.
+```sh
+pnpm add cfordo
+```
 
-## Specification
-
-### Usage
+## Define a step
 
 ```ts
 import { Ordo } from "cfordo";
 
 type Params = { value: number };
 const ordo = new Ordo<Env, Params>();
-ordo.configure({ deadLetterQueue: "example-ordo-queue-dlq" });
 
 ordo.step<{ value: number }>({
   name: "double",
@@ -37,32 +34,27 @@ ordo.step<{ value: number }>({
 export default ordo;
 ```
 
-Use Wrangler-generated binding types for `Env`. No subclass, `setup()`, or `.worker()` is needed.
-The default export provides HTTP, Queue, and Cron entrypoints. Applications do not need a separate Hono app or startup handler.
+Use Wrangler-generated binding types for `Env`. `run` is required; `validate` and `evaluate` are optional.
+Await persistence operations or return their Promise. Returning business data alone does not save it.
+Use unique step names and register steps and settings before processing starts.
 
-### Startup and progress
+| API | Purpose |
+| --- | --- |
+| `ctx.input().params` | Goal input |
+| `ctx.input().result` | The run output being validated or evaluated |
+| `await ctx.complete(data)` | Save a run's result |
+| `await ctx.ok()` / `await ctx.ng(reason)` | Save a check verdict |
+| `await ctx.result<T>(stepName)` | Get a successful step's result in the same Goal |
+| `ctx.env` | Bindings, including D1 |
+| `ctx.feedback` | Improvement `iteration` and the previous negative verdict's `source` and `reason` |
+| `ctx.goalId` / `ctx.stepName` / `ctx.attemptId` | Current Goal, step, and execution identifiers |
 
-Starting a Goal persists its input in D1 and returns HTTP 202 with a numeric Goal ID. POST does not wait for completion; each POST creates a separate Goal.
-A permanent every-minute Cron checks unfinished Goals. When none exist, there is no work to perform.
-Run, validate, and evaluate execute consecutively within an iteration. Only the next improvement iteration or following step waits for another Cron invocation.
-Queue actions save results and finish independently. They neither schedule successors nor send completion notifications.
+Input and results must be JSON-compatible. Non-finite numbers and `undefined` cannot be saved. Use `ctx.complete(null)` when no result is needed.
 
-### Steps and parallel execution
+## Parallel steps and shared results
 
-Pass a definition to `ordo.step<Result>()`:
-
-| Key        | Required | Purpose                                                                      |
-| ---------- | -------- | ---------------------------------------------------------------------------- |
-| `name`     | Yes      | Unique step name                                                             |
-| `run`      | Yes      | Business logic; save the outcome with `ctx.complete(data)`                   |
-| `validate` | No       | Business-rule validation; save a verdict with `ctx.ok()` or `ctx.ng(reason)` |
-| `evaluate` | No       | Result evaluation; save a verdict with `ctx.ok()` or `ctx.ng(reason)`        |
-
-All handlers are asynchronous. Await persistence operations or return their Promise. Returning business data does not save it.
-One Queue invocation executes one iteration in run → validate → evaluate order, using the same context object. Omitted checks are skipped; a negative validation also skips evaluation.
-Steps advance in registration order, after all required checks on the preceding step succeed.
-
-Steps registered inside `ordo.parallel()` advance concurrently. Awaiting registration is distinct from waiting for execution to finish.
+Steps advance in registration order. Wrap parallel steps in `ordo.parallel()`.
+Use `ctx.result()` to obtain prior steps' results instead of sharing variables or return values.
 
 ```ts
 await ordo.parallel(async () => {
@@ -88,123 +80,41 @@ ordo.step<{ value: number }>({
 });
 ```
 
-A subsequent group starts only after every step in the current group passes. Retrying one step does not rerun successful siblings.
-Duplicate names, empty groups, and nested parallel groups are rejected. Registrations and settings cannot change after processing starts.
-The [complete example](example/src/index.ts) includes validation and evaluation for all three steps.
+This replaces the first `double` definition. The next step starts after every parallel step passes its checks.
+`ctx.result()` throws for unfinished or failed steps. See the [example](example/src/index.ts) for validation and evaluation on all three steps.
 
-### Input, results, and bindings
+## Configure improvements and expiration
 
-Between steps, obtain data from D1 rather than shared variables, closures, or return values. The handlers within one iteration share a context.
-At the start of each execution, Ordo loads the Goal input and feedback from the previous iteration's first final result in D1. Checks read the result saved by the run in this iteration.
+`configure()` is optional. Call it before processing starts.
 
-| API or value                    | Purpose                                                                                   |
-| ------------------------------- | ----------------------------------------------------------------------------------------- |
-| `ctx.input().params`            | This Goal's startup input, typed as `Params`                                              |
-| `ctx.input().result`            | The referenced run's saved result in checks, typed as `Result`; `undefined` in run        |
-| `await ctx.result<T>(stepName)` | Read the entire saved output of a successfully completed step in the same Goal from D1    |
-| `ctx.env`                       | Bindings for this invocation, including `ctx.env.DB` and any application bindings         |
-| `await ctx.complete(data)`      | Save a run's business result                                                              |
-| `await ctx.ok()`                | Save a successful check verdict; takes no arguments                                       |
-| `await ctx.ng(reason)`          | Save a negative verdict with a non-blank reason                                           |
-| `ctx.goalId`                    | Goal ID                                                                                   |
-| `ctx.stepName`                  | Current step name                                                                         |
-| `ctx.attemptId`                 | Current phase execution record ID; changes between phases on the shared context           |
-| `ctx.feedback`                  | `{ iteration, source, reason }`; initially `{ iteration: 1, source: null, reason: null }` |
+```ts
+ordo.configure({ maxIterations: 3, expiresIn: 24 * 60 * 60 * 1000 });
+```
 
-`ctx.result()` rejects unregistered, unstarted, unfinished, and failed steps. A successful run alone is insufficient when required checks remain.
-No explicit Goal ID is needed, and results from different Goals cannot mix. Applications need not know Ordo's table layout.
-Mutating a retrieved value does not change stored data. Feedback is fixed within an iteration. A new improvement iteration or Queue retry reconstructs its context from D1.
+- `maxIterations`: per-step improvement limit including the initial run; defaults to 3.
+- `expiresIn`: Goal lifetime from acceptance, in milliseconds; defaults to 24 hours. Changes also apply to existing unfinished Goals.
+- A negative check starts another iteration from run, with its reason available through `ctx.feedback`. Negative validation skips evaluation.
+- An exception fails the Goal without automatically rerunning the business operation, including exceptions after saving a result.
+- Executions expire 15 minutes after receipt. Unfinished work is rerun after expiration, so external side effects must be idempotent.
+- Once a Goal's expiration is finalized, extending the lifetime does not restart it.
 
-Binding names are fixed: `DB` for D1 and `QUEUE` for the dedicated Queue. `Env` must satisfy `OrdoEnv`; additional application bindings are supported.
-Specify the native dead-letter queue consumed by this Worker with `configure({ deadLetterQueue })`. Queue retry counts and delays are managed only in the Wrangler consumer configuration.
-Type arguments provide static types, not runtime business-schema validation. Omitted input and result types default to `any`.
+## Deploy your Worker
 
-### Persistence, improvement loops, and exception retries
-
-Inputs and business results must be JSON-compatible. Undefined values, non-finite numbers, and cycles cannot be saved. Use `ctx.complete(null)` when no result is needed.
-A phase completes after saving its required outcome and returning successfully. An exception after saving is still recorded as a failure. Every re-execution must save its own outcome.
-
-- A negative validation or evaluation ends the current iteration normally after saving its results. A negative verdict is not an exception.
-- The next Cron invocation starts another iteration, increments `ctx.feedback.iteration`, and supplies the negative verdict through `source` and `reason`.
-- The improvement limit is 10 iterations including the initial iteration, shared by validation and evaluation. Passing on iteration 10 succeeds; a negative verdict on iteration 10 fails the Goal for unmet quality.
-- Exceptions use Queue retries to restart the same iteration from run. Previously successful phases can execute again; external side effects must be idempotent.
-- Queue retries do not change the iteration number or previous iteration's feedback. Exceptions do not consume improvement iterations.
-- Cron does not resend queued, running, or retrying iterations. Failed sends can be retried by Cron; an interrupted send becomes eligible after its one-minute send-confirmation deadline.
-- Every received copy of a job executes and stores its own results. The existing Goal expiration still prevents new phases from starting after the deadline.
-- For the same Goal, step, and improvement iteration, use the first whole-execution result persisted in D1. Execution start order and run-only persistence do not determine the winner. A later OK cannot replace an earlier NG, and late results of earlier iterations cannot change current progress.
-- Messages that exhaust Queue retries are handled by the native DLQ, which saves a final `QueueRetriesExhausted` result in D1. The next Cron determines Goal termination from the first final result for that iteration. A later DLQ report does not replace an earlier success or negative verdict. Cron does not reset the Queue retry budget by sending a new message.
-
-History preserves phases from each Queue execution. `executions.iteration` identifies the improvement iteration and `delivery` identifies the Queue delivery attempt. Different messages or duplicate deliveries may have the same delivery attempt number. Each phase has its own `attemptId`, and `sourceRunId` associates checks with their run. These fields are omitted on historical records from the earlier format.
-Successful example Goals still have three records per step and nine in total. An iteration rejected by validation has no evaluation record.
-
-Expiration is fixed at acceptance and never extended by improvement or retries. The default is 24 hours; change it with `ordo.configure({ deadLetterQueue: "...", expiresIn: milliseconds })`.
-No new phases start after expiration. Already-running code is not guaranteed to stop at that exact instant, and late results may remain in history.
-
-### Goal API
-
-| Method and path            | Input               | Response                                             |
-| -------------------------- | ------------------- | ---------------------------------------------------- |
-| `POST /_ordo/goals`        | Business input JSON | `202 { "goalId": 1 }` and a `Location` header        |
-| `GET /_ordo/goals`         | None                | All Goals in descending ID order, without pagination |
-| `GET /_ordo/goals/:goalId` | Positive integer ID | One Goal with results and execution history          |
-
-Common fields are `goalId`, `input`, `status`, `createdAt`, `expiresAt`, `finishedAt`, `error`, and `results`.
-Status is `ready`, `running`, `completed`, `failed`, or `expired`. Dates are Unix epoch milliseconds; an unobserved finish time is `null`.
-Each result contains `stepName`, `status`, `action`, `output`, `validation`, `evaluation`, `error`, `createdAt`, and `finishedAt`. Unstarted steps are included.
-`action` identifies the current or next action and is `null` after step completion. An iteration with final results displays its first final result; otherwise it displays execution progress for that iteration. Output and verdicts refer to the same run; missing values are `null`.
-In-flight and failed outputs can be visible. Only accept a step's result when its status is `completed`.
-
-Only detail responses contain `executions`, including executions not used for progress, ordered by execution record ID. List responses omit them.
-Entries contain `attemptId`, `action`, `sourceRunId`, `status`, `output`, `verdict`, `error`, `createdAt`, and `finishedAt`.
-`sourceRunId` identifies the checked run and is `null` for run itself. Verdicts are `{ "ok": true }` or `{ "ok": false, "reason": "..." }`.
-Errors are `{ "code": "...", "message": "..." }`, or `null` when absent.
-
-Invalid JSON or IDs return HTTP 400, missing Goals return 404, and unexpected infrastructure errors return 500.
-Business failure or expiration still returns HTTP 200 when the query succeeds; inspect `status` and `error`.
-A lost startup response may leave a saved Goal. Repeating POST creates another Goal.
-
-## Development environment
-
-Use Node.js and pnpm from `mise.toml`, `tsrs` for type checking, and Wrangler for deployment.
-Generate application binding and runtime types with `wrangler types`.
-
-## Development
+Use one Ordo per dedicated Worker, with its own D1 and Queue.
+Name the D1 binding `DB` and the Queue producer binding `QUEUE`. Configure a consumer for that Queue and an every-minute Cron. No DLQ is needed.
+Start from the [Wrangler configuration example](example/wrangler.example.jsonc) and supply your resource names and IDs.
+Keep `workers_dev: false`, `preview_urls: false`, and `routes: []`; call the Worker through a service binding.
 
 ```sh
-mise install
-pnpm install --frozen-lockfile
-pnpm format
-pnpm check
+npx wrangler types
+npx wrangler deploy
 ```
 
-`pnpm check` checks library types, builds the library, and checks example types.
-Local checks are limited to type checking and builds. Verify behavior with the [production example instructions](example/README.md).
-`pnpm build` emits ESM, declarations, and source maps to `dist`.
+Tables are created automatically. An update that changes the schema version starts with empty tables; old data and unfinished work are not transferred.
 
-## Deployment
+## Start and read Goals
 
-Publish with `pnpm run deploy` using an account with npm publishing permission, after production example verification completes.
-Configure each application Worker with D1, a Queue producer/consumer, a native DLQ, and an every-minute Cron. The same Worker consumes the DLQ; pass its name to `configure({ deadLetterQueue })`:
-
-```json
-{
-  "queues": {
-    "consumers": [
-      {
-        "queue": "example-ordo-queue",
-        "max_retries": 3,
-        "dead_letter_queue": "example-ordo-queue-dlq"
-      },
-      { "queue": "example-ordo-queue-dlq" }
-    ]
-  },
-  "triggers": { "crons": ["* * * * *"] }
-}
-```
-
-Keep the Cron configured permanently. Adding, changing, or removing its schedule may take time to propagate across Cloudflare.
-Disable public access with `workers_dev: false`, `preview_urls: false`, and `routes: []`.
-The calling Worker declares a service binding:
+Configure a service binding on the calling Worker. Set `service` to your deployed Worker name.
 
 ```json
 { "services": [{ "binding": "ORDO", "service": "example-ordo" }] }
@@ -220,7 +130,16 @@ const { goalId } = await response.json<{ goalId: number }>();
 const detail = await env.ORDO.fetch(`https://ordo/_ordo/goals/${goalId}`);
 ```
 
-The URL is used to construct a Request; the binding selects the destination. No public domain or DNS configuration is needed.
-Ordo initializes and migrates the database automatically. Explicit initialization is available through `initOrdo(env.DB)`.
-Before migrating an old deployment, confirm its old Workflow and Queue processing has finished.
-Existing per-action databases and history are preserved; no database reset is required.
+The service binding selects the destination, not the URL hostname.
+POST returns HTTP 202 and a Goal ID without waiting for completion. Each POST creates a new Goal, so handle repeated requests accordingly.
+Starting steps, improvement iterations, and subsequent steps waits for scheduled processing.
+
+| Method and path | Response |
+| --- | --- |
+| `POST /_ordo/goals` | `202 { "goalId": 1 }` |
+| `GET /_ordo/goals` | Goals in descending ID order, without execution history |
+| `GET /_ordo/goals/:goalId` | Input, status, step results, and execution history |
+
+`status` is `ready`, `running`, `completed`, `failed`, or `expired`. Step results are in `results`; failure information is in `error`.
+In-flight and failed outputs are visible, so check for `completed` before accepting results. Detail responses include per-phase history in `executions`.
+Invalid JSON or IDs return 400; missing Goals return 404. Business failure still returns HTTP 200 when retrieval succeeds.
