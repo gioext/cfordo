@@ -1,4 +1,4 @@
-import { listPendingGoals } from "../db/store.ts";
+import { listPendingGoals, updateGoal } from "../db/store.ts";
 import { startGoal, readGoal, readGoals } from "./goal.ts";
 import { runPlanner } from "./planner.ts";
 import { consumeQueue } from "./worker.ts";
@@ -47,6 +47,13 @@ export class Definition<
       this.maxIterations,
       this.expiresIn,
     );
+  }
+
+  async stop(env: Env, id: number) {
+    this.ready(env);
+    await initOrdo(env.DB);
+    await updateGoal(env.DB, id, "stopped", this.expiresIn);
+    return this.get(env, id);
   }
 
   async queue(

@@ -38,16 +38,16 @@ Use Wrangler-generated binding types for `Env`. `run` is required; `validate` an
 Await persistence operations or return their Promise. Returning business data alone does not save it.
 Use unique step names and register steps and settings before processing starts.
 
-| API | Purpose |
-| --- | --- |
-| `ctx.input().params` | Goal input |
-| `ctx.input().result` | The run output being validated or evaluated |
-| `await ctx.complete(data)` | Save a run's result |
-| `await ctx.ok()` / `await ctx.ng(reason)` | Save a check verdict |
-| `await ctx.result<T>(stepName)` | Get a successful step's result in the same Goal |
-| `ctx.env` | Bindings, including D1 |
-| `ctx.feedback` | Improvement `iteration` and the previous negative verdict's `source` and `reason` |
-| `ctx.goalId` / `ctx.stepName` / `ctx.attemptId` | Current Goal, step, and execution identifiers |
+| API                                             | Purpose                                                                           |
+| ----------------------------------------------- | --------------------------------------------------------------------------------- |
+| `ctx.input().params`                            | Goal input                                                                        |
+| `ctx.input().result`                            | The run output being validated or evaluated                                       |
+| `await ctx.complete(data)`                      | Save a run's result                                                               |
+| `await ctx.ok()` / `await ctx.ng(reason)`       | Save a check verdict                                                              |
+| `await ctx.result<T>(stepName)`                 | Get a successful step's result in the same Goal                                   |
+| `ctx.env`                                       | Bindings, including D1                                                            |
+| `ctx.feedback`                                  | Improvement `iteration` and the previous negative verdict's `source` and `reason` |
+| `ctx.goalId` / `ctx.stepName` / `ctx.attemptId` | Current Goal, step, and execution identifiers                                     |
 
 Input and results must be JSON-compatible. Non-finite numbers and `undefined` cannot be saved. Use `ctx.complete(null)` when no result is needed.
 
@@ -134,12 +134,24 @@ The service binding selects the destination, not the URL hostname.
 POST returns HTTP 202 and a Goal ID without waiting for completion. Each POST creates a new Goal, so handle repeated requests accordingly.
 Starting steps, improvement iterations, and subsequent steps waits for scheduled processing.
 
-| Method and path | Response |
-| --- | --- |
-| `POST /_ordo/goals` | `202 { "goalId": 1 }` |
-| `GET /_ordo/goals` | Goals in descending ID order, without execution history |
-| `GET /_ordo/goals/:goalId` | Input, status, step results, and execution history |
+| Method and path                  | Response                                                        |
+| -------------------------------- | --------------------------------------------------------------- |
+| `POST /_ordo/goals`              | `202 { "goalId": 1 }`                                           |
+| `GET /_ordo/goals`               | Goals in descending ID order, without execution history         |
+| `GET /_ordo/goals/:goalId`       | Input, status, step results, and execution history              |
+| `POST /_ordo/goals/:goalId/stop` | `200` with the current Goal detail, including execution history |
 
-`status` is `ready`, `running`, `completed`, `failed`, or `expired`. Step results are in `results`; failure information is in `error`.
+`status` is `ready`, `running`, `completed`, `failed`, `expired`, or `stopped`. Step results are in `results`; failure information is in `error`.
 In-flight and failed outputs are visible, so check for `completed` before accepting results. Detail responses include per-phase history in `executions`.
 Invalid JSON or IDs return 400; missing Goals return 404. Business failure still returns HTTP 200 when retrieval succeeds.
+
+## Stop a Goal
+
+```ts
+await env.ORDO.fetch(`https://ordo/_ordo/goals/${goalId}/stop`, { method: "POST" });
+```
+
+- An unfinished Goal within its lifetime becomes `stopped`, preventing further progress and result saves. Requests are idempotent; finished Goals remain unchanged.
+- Completed outputs and history are preserved. Unfinished steps and executions show `stopped`.
+- Already claimed work is not forcibly interrupted. Database writes and external side effects are not rolled back.
+- No database migration is needed. Update callers to handle `stopped` statuses.

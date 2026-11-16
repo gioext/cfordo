@@ -311,8 +311,8 @@ export async function saveOutcome(
   if (result.meta.changes !== 1)
     throw new ExecutionStopped("Execution is no longer active");
 }
-// Completing a nonfinal phase and creating its successor are atomic, so a stopped
-// execution always leaves either a final outcome or an unfinished phase to expire.
+// Completing a nonfinal phase and creating its successor are atomic. Goal state
+// guards both writes, including when a stop races with phase completion.
 export async function finishAttempt(
   db: DatabaseBinding,
   item: Attempt,

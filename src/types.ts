@@ -1,7 +1,7 @@
 export type JsonValue =
   null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type GoalStatus =
-  "ready" | "running" | "completed" | "failed" | "expired";
+  "ready" | "running" | "completed" | "failed" | "expired" | "stopped";
 export type EffectiveGoalStatus = GoalStatus;
 export type Action = "run" | "validate" | "evaluate";
 export type CheckSource = Exclude<Action, "run">;
@@ -150,7 +150,7 @@ export interface ExecutionDetail {
   iteration: number;
   action: Action;
   sourceRunId: number | null;
-  status: AttemptStatus;
+  status: AttemptStatus | "stopped";
   output: JsonValue;
   verdict: CheckResult | null;
   error: ErrorInfo | null;

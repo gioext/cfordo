@@ -11,6 +11,7 @@ export class Ordo<
     start: (input) => this.definition.start(env, input),
     list: () => this.definition.list(env),
     get: (id) => this.definition.get(env, id),
+    stop: (id) => this.definition.stop(env, id),
   }));
 
   configure(options: OrdoOptions): void {

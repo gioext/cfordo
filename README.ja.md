@@ -34,16 +34,16 @@ export default ordo;
 保存操作はawaitするか、そのPromiseを返す。業務データをreturnするだけでは保存されない。
 工程名は一意にし、登録・設定は処理開始前に済ませる。
 
-| API | 用途 |
-| --- | --- |
-| `ctx.input().params` | Goalの起動入力 |
-| `ctx.input().result` | 検証・評価の対象runの結果 |
-| `await ctx.complete(data)` | runの結果を保存 |
-| `await ctx.ok()` / `await ctx.ng(reason)` | 検証・評価の判定を保存 |
-| `await ctx.result<T>(stepName)` | 同じGoalの成功済み工程の結果を取得 |
-| `ctx.env` | D1などのBindings |
-| `ctx.feedback` | 改善周回の`iteration`と前回NGの`source`・`reason` |
-| `ctx.goalId` / `ctx.stepName` / `ctx.attemptId` | 現在のGoal・工程・実行の識別子 |
+| API                                             | 用途                                              |
+| ----------------------------------------------- | ------------------------------------------------- |
+| `ctx.input().params`                            | Goalの起動入力                                    |
+| `ctx.input().result`                            | 検証・評価の対象runの結果                         |
+| `await ctx.complete(data)`                      | runの結果を保存                                   |
+| `await ctx.ok()` / `await ctx.ng(reason)`       | 検証・評価の判定を保存                            |
+| `await ctx.result<T>(stepName)`                 | 同じGoalの成功済み工程の結果を取得                |
+| `ctx.env`                                       | D1などのBindings                                  |
+| `ctx.feedback`                                  | 改善周回の`iteration`と前回NGの`source`・`reason` |
+| `ctx.goalId` / `ctx.stepName` / `ctx.attemptId` | 現在のGoal・工程・実行の識別子                    |
 
 入力・結果はJSON互換の値に限る。非有限数値や`undefined`は保存できない。結果が不要なら`ctx.complete(null)`を使う。
 
@@ -130,12 +130,24 @@ URLのホスト名は通信先を決めない。通信先はサービスBinding�
 POSTは完了を待たずにHTTP 202とGoal IDを返す。各POSTは新しいGoalを作るため、再送で重複起動しないように扱う。
 工程の開始・次の改善周回・後続工程への進行には定期起動を待つ。
 
-| メソッド・パス | 応答 |
-| --- | --- |
-| `POST /_ordo/goals` | `202 { "goalId": 1 }` |
-| `GET /_ordo/goals` | Goal ID降順の一覧。実行履歴は含まない |
-| `GET /_ordo/goals/:goalId` | 入力・状態・工程別結果・実行履歴 |
+| メソッド・パス                   | 応答                                  |
+| -------------------------------- | ------------------------------------- |
+| `POST /_ordo/goals`              | `202 { "goalId": 1 }`                 |
+| `GET /_ordo/goals`               | Goal ID降順の一覧。実行履歴は含まない |
+| `GET /_ordo/goals/:goalId`       | 入力・状態・工程別結果・実行履歴      |
+| `POST /_ordo/goals/:goalId/stop` | `200`と現在のGoal詳細。実行履歴も含む |
 
-`status`は`ready`・`running`・`completed`・`failed`・`expired`。結果は`results`、失敗理由は`error`に入る。
+`status`は`ready`・`running`・`completed`・`failed`・`expired`・`stopped`。結果は`results`、失敗理由は`error`に入る。
 途中・失敗時の結果も表示されるため、採用する前に`completed`を確認する。詳細の`executions`で各段階の履歴を取得できる。
 不正なJSON・IDは400、不存在のGoalは404。業務上の失敗でも、取得できればHTTP 200を返す。
+
+## Goalを停止する
+
+```ts
+await env.ORDO.fetch(`https://ordo/_ordo/goals/${goalId}/stop`, { method: "POST" });
+```
+
+- 有効期限内の未終了Goalを`stopped`にし、以後の進行・結果保存を止める。再要求は冪等で、終了済みGoalは変更しない。
+- 完了済みの成果物と履歴は保持し、未完了工程・実行は`stopped`と表示する。
+- 実行権を取得済みの処理は強制終了せず、DB更新・外部副作用も巻き戻さない。
+- DB移行は不要。利用側の状態判定に`stopped`を追加する。

@@ -15,11 +15,11 @@ cp example/wrangler.example.jsonc example/wrangler.jsonc
 
 初回だけ設定例をコピーし、`wrangler.jsonc`に自分の`account_id`・`database_id`を設定する。対象アカウントでWranglerを認証し、次のリソースを用意する。
 
-| リソース | 名前 |
-| --- | --- |
-| Worker | `example-ordo` |
-| D1 | `example-ordo-db` |
-| Queue | `example-ordo-queue` |
+| リソース | 名前                 |
+| -------- | -------------------- |
+| Worker   | `example-ordo`       |
+| D1       | `example-ordo-db`    |
+| Queue    | `example-ordo-queue` |
 
 実IDはGit管理外の`wrangler.jsonc`だけに記載する。`remote: true`、毎分のCron、公開URL無効の設定を維持し、DLQは設定しない。
 Binding設定を変更した場合は`pnpm --filter @cfordo/example types`で型を再生成する。
@@ -68,10 +68,10 @@ pnpm --filter @cfordo/example exec wrangler d1 execute example-ordo-db --remote 
 ### 通常検証の期待結果
 
 | 入力 | double | square | sum |
-| --- | --- | --- | --- |
-| 7 | 14 | 49 | 63 |
-| 11 | 22 | 121 | 143 |
-| 23 | 46 | 529 | 575 |
+| ---- | ------ | ------ | --- |
+| 7    | 14     | 49     | 63  |
+| 11   | 22     | 121    | 143 |
+| 23   | 46     | 529    | 575 |
 
 - 各POSTがHTTP 202と異なる数値のGoal IDを返し、別Goalの入力・結果が混ざらない。3工程の検証・評価とGoal全体が成功する。
 - 各工程の履歴はrun・validate・evaluateの3件、Goalごとに計9件。検証・評価の`sourceRunId`が対応するrunを指す。sumは先行2工程の検証・評価完了後に始まり、runとevaluateでD1の両結果を取得する。
@@ -88,6 +88,24 @@ pnpm --filter @cfordo/example exec wrangler d1 execute example-ordo-db --remote 
 - 重複配送やplannerの並行実行で、同じ仕事を重複して開始・再配送しない。古い実行の遅れた結果・NG・例外が現在の進行を変えない。
 - Goalの期限が先なら再配送しない。復帰によってGoalの期限が延びず、一覧・詳細が期限切れを示す。plannerが終了状態・終了時刻を確定した後は、期限を延長しても再開しない。
 - 期限設定の変更が既存の未完了Goalにも適用される。
+
+### 停止機能の追加検証
+
+停止・遅延・競合を伴うため、明示的に依頼された場合に実施する。上記の通常検証も実施する。
+
+```sh
+pnpm --filter @cfordo/example request POST /_ordo/goals/1/stop
+pnpm --filter @cfordo/example request GET /_ordo/goals/1
+```
+
+IDは対象Goalに置き換える。一時変更は既存example内だけで行い、終了時に元へ戻す。API応答は実際のD1記録と照合する。
+
+- 未開始・実行中のGoalを停止し、HTTP 200、`stopped`、停止時刻、Goalの`error: null`を確認する。同一IDを繰り返し停止しても状態・終了時刻・履歴は変わらない。不正IDは400、不存在は404。
+- 完了・失敗・期限切れのGoalへの停止要求は現在状態・終了時刻を維持する。期限経過後、plannerによる確定前の停止要求でも期限切れのままとなる。
+- 一覧と詳細で未完了工程が`stopped`・`action: null`となり、未完了実行も`stopped`となる。完了済み工程、出力・判定・実際のエラー履歴は保持される。停止情報を工程や実行行へ重複保存していないことを照合する。
+- 既存exampleの各段階を一時的に遅延し、停止後に到着する結果・NG・例外・保存済み結果の完了処理が、履歴やGoalを変更せず後続段階を始めないことを確認する。
+- 実際のQueueメッセージを停止後に再配送し、受領完了となり、処理の再実行・再試行ループが起きないことを確認する。次の定期起動後も改善周回・配送回復・後続工程を開始しない。
+- 完了・失敗・期限切れの確定と停止を競合させ、先に確定した終端状態と終了時刻が保持されることをD1とAPIで確認する。競合が実際に発生したことを確認できなかった組合せは未確認として報告する。
 
 ### 終了・報告
 

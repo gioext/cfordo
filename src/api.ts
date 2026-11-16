@@ -1,5 +1,5 @@
 import { assertJson } from "./core/validation.ts";
-import { Hono } from "hono";
+import { Hono, type Handler } from "hono";
 import { GoalNotFoundError } from "./db/store.ts";
 import type { GoalDetail, GoalSummary, OrdoEnv } from "./types.ts";
 
@@ -7,6 +7,7 @@ interface Goals {
   start(input: unknown): Promise<number>;
   list(): Promise<GoalSummary[]>;
   get(id: number): Promise<GoalDetail>;
+  stop(id: number): Promise<GoalDetail>;
 }
 
 export function createApi<Env extends OrdoEnv>(
@@ -50,21 +51,27 @@ export function createApi<Env extends OrdoEnv>(
     const goals = await resolve(c.env, c.executionCtx as ExecutionContext);
     return c.json(await goals.list());
   });
-  app.get("/_ordo/goals/:goalId", async (c) => {
-    const raw = c.req.param("goalId");
-    const id = Number(raw);
-    if (!/^[1-9]\d*$/.test(raw) || !Number.isSafeInteger(id))
-      return c.json(
-        {
-          error: {
-            code: "InvalidGoalId",
-            message: "Goal ID must be a positive integer",
+  const goalHandler =
+    (
+      action: "get" | "stop",
+    ): Handler<{ Bindings: Env }, "/_ordo/goals/:goalId"> =>
+    async (c) => {
+      const raw = c.req.param("goalId");
+      const id = Number(raw);
+      if (!/^[1-9]\d*$/.test(raw) || !Number.isSafeInteger(id))
+        return c.json(
+          {
+            error: {
+              code: "InvalidGoalId",
+              message: "Goal ID must be a positive integer",
+            },
           },
-        },
-        400,
-      );
-    const goals = await resolve(c.env, c.executionCtx as ExecutionContext);
-    return c.json(await goals.get(id));
-  });
+          400,
+        );
+      const goals = await resolve(c.env, c.executionCtx as ExecutionContext);
+      return c.json(await goals[action](id));
+    };
+  app.get("/_ordo/goals/:goalId", goalHandler("get"));
+  app.post("/_ordo/goals/:goalId/stop", goalHandler("stop"));
   return app;
 }

@@ -41,19 +41,23 @@ function errorInfo(
 function execution(
   item: Attempt,
   history: readonly Attempt[],
+  goal: Goal,
 ): ExecutionDetail {
+  const stopped =
+    goal.status === "stopped" &&
+    (item.status === "ready" || item.status === "running");
   return {
     attemptId: item.id,
     iteration: feedback(history.filter((a) => a.id < item.deliveryId))
       .iteration,
     action: item.action!,
     sourceRunId: item.action === "run" ? null : item.runId,
-    status: item.status!,
+    status: stopped ? "stopped" : item.status!,
     output: item.action === "run" ? (item.output ?? null) : null,
     verdict: verdict(item),
     error: errorInfo(item.error),
     createdAt: item.createdAt,
-    finishedAt: item.finishedAt,
+    finishedAt: stopped ? goal.finishedAt : item.finishedAt,
   };
 }
 function stepResult(
@@ -62,6 +66,7 @@ function stepResult(
   definition: RegisteredStep | undefined,
   goalStatus: EffectiveGoalStatus,
   maxIterations: number,
+  goalFinishedAt: number | null,
 ): StepResult {
   const active = goalStatus === "ready" || goalStatus === "running";
   // Historical outcomes do not reinterpret a failed Goal using today's improvement limit.
@@ -91,6 +96,10 @@ function stepResult(
     (goalStatus === "failed" || goalStatus === "expired")
   )
     status = goalStatus;
+  if (goalStatus === "stopped" && status !== "completed") {
+    status = "stopped";
+    finishedAt = goalFinishedAt;
+  }
   if (!active || status === "failed") action = null;
   return {
     stepName: name,
@@ -119,6 +128,7 @@ export async function readResult<T>(
     definition,
     getGoalStatus(goal, expiresIn),
     maxIterations,
+    goal.finishedAt,
   );
   if (result.status !== "completed")
     throw new Error(
@@ -145,6 +155,7 @@ function summary(
       definitions.find((item) => item.name === name),
       status,
       maxIterations,
+      goal.finishedAt,
     ),
   );
   // Every cause comes from its execution row; no representative error is copied onto a Goal.
@@ -187,7 +198,7 @@ export async function readGoal(
         ...item,
         executions: stepHistory
           .filter((a) => a.action !== null)
-          .map((a) => execution(a, stepHistory)),
+          .map((a) => execution(a, stepHistory, goal)),
       };
     }),
   };
