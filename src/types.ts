@@ -77,6 +77,8 @@ export interface ImprovementFeedback {
 }
 
 export interface OrdoOptions {
+  /** Workflow identity within the shared D1; defaults to "default". */
+  workflow?: string;
   /** Goal lifetime in milliseconds; defaults to 24 hours and applies to unfinished Goals. */
   expiresIn?: number;
   /** Maximum iterations per step including the initial run; defaults to 3. */

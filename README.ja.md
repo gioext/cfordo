@@ -31,8 +31,6 @@ export default ordo;
 ```
 
 `Env`にはWranglerで生成したBinding型を使う。`run`は必須、`validate`・`evaluate`は任意。
-保存操作はawaitするか、そのPromiseを返す。業務データをreturnするだけでは保存されない。
-工程名は一意にし、登録・設定は処理開始前に済ませる。
 
 | API                                             | 用途                                              |
 | ----------------------------------------------- | ------------------------------------------------- |
@@ -45,11 +43,9 @@ export default ordo;
 | `ctx.feedback`                                  | 改善周回の`iteration`と前回NGの`source`・`reason` |
 | `ctx.goalId` / `ctx.stepName` / `ctx.attemptId` | 現在のGoal・工程・実行の識別子                    |
 
-入力・結果はJSON互換の値に限る。非有限数値や`undefined`は保存できない。結果が不要なら`ctx.complete(null)`を使う。
-
 ## 並列実行と工程間の参照
 
-工程は登録順に進む。並列に実行する工程は`ordo.parallel()`で囲む。
+並列に実行する工程は`ordo.parallel()`で囲む。
 後続工程では、変数や戻り値を共有せず`ctx.result()`で先行工程の結果を取得する。
 
 ```ts
@@ -76,8 +72,7 @@ ordo.step<{ value: number }>({
 });
 ```
 
-上記は最初の`double`定義を置き換える例。並列グループの全工程が検証・評価まで成功すると後続へ進む。
-未完了・失敗した工程の`ctx.result()`はエラーになる。全工程に検証・評価を付けた[example](example/src/index.ts)も参照できる。
+上記は最初の`double`定義を置き換える例。全工程に検証・評価を付けた[example](example/src/index.ts)も参照できる。
 
 ## 改善と期限の設定
 
@@ -87,17 +82,13 @@ ordo.step<{ value: number }>({
 ordo.configure({ maxIterations: 3, expiresIn: 24 * 60 * 60 * 1000 });
 ```
 
-- `maxIterations`：初回を含む工程ごとの改善上限。既定は3回。
-- `expiresIn`：Goalの受付からの有効期間（ミリ秒）。既定は24時間。設定変更は既存の未完了Goalにも適用する。
-- 検証・評価がNGなら、その理由を`ctx.feedback`で受け取り、次の周でrunからやり直す。validateがNGならevaluateは省略する。
-- 処理例外はGoalの失敗となり、自動再実行しない。結果の保存後に例外を投げた場合も失敗となる。
-- 実行期限は受信から15分。未完了の処理は期限後に再実行されるため、外部への副作用は冪等に扱う。
-- Goalの期限切れが確定した後は、設定を延長しても再開しない。
+- `maxIterations`：工程ごとの改善回数の上限。
+- `expiresIn`：Goalの有効期間（ミリ秒）。
 
 ## Workerを配置する
 
-専用Workerに1つのOrdoを配置し、専用のD1とQueueを用意する。
-D1のBinding名は`DB`、Queue producerのBinding名は`QUEUE`。同じQueueのconsumerと毎分のCronも設定する。DLQは不要。
+専用Workerに1つのOrdoと専用Queueを配置する。異なる`workflow`を設定すればD1を共有できる。
+D1のBinding名は`DB`、Queue producerのBinding名は`QUEUE`。同じQueueのconsumerと毎分のCronも設定する。
 [Wranglerの設定例](example/wrangler.example.jsonc)を基に、自分のリソース名・IDを指定する。
 `workers_dev: false`・`preview_urls: false`・`routes: []`を維持し、サービスBinding経由で呼び出す。
 
@@ -105,8 +96,6 @@ D1のBinding名は`DB`、Queue producerのBinding名は`QUEUE`。同じQueueのc
 npx wrangler types
 npx wrangler deploy
 ```
-
-DBのテーブルは自動作成される。スキーマバージョンが変わる更新では新しい空のテーブルを使用し、旧データや未完了処理は引き継がない。
 
 ## Goalを起動・取得する
 
@@ -126,10 +115,6 @@ const { goalId } = await response.json<{ goalId: number }>();
 const detail = await env.ORDO.fetch(`https://ordo/_ordo/goals/${goalId}`);
 ```
 
-URLのホスト名は通信先を決めない。通信先はサービスBindingで決まる。
-POSTは完了を待たずにHTTP 202とGoal IDを返す。各POSTは新しいGoalを作るため、再送で重複起動しないように扱う。
-工程の開始・次の改善周回・後続工程への進行には定期起動を待つ。
-
 | メソッド・パス                   | 応答                                  |
 | -------------------------------- | ------------------------------------- |
 | `POST /_ordo/goals`              | `202 { "goalId": 1 }`                 |
@@ -137,17 +122,8 @@ POSTは完了を待たずにHTTP 202とGoal IDを返す。各POSTは新しいGoa
 | `GET /_ordo/goals/:goalId`       | 入力・状態・工程別結果・実行履歴      |
 | `POST /_ordo/goals/:goalId/stop` | `200`と現在のGoal詳細。実行履歴も含む |
 
-`status`は`ready`・`running`・`completed`・`failed`・`expired`・`stopped`。結果は`results`、失敗理由は`error`に入る。
-途中・失敗時の結果も表示されるため、採用する前に`completed`を確認する。詳細の`executions`で各段階の履歴を取得できる。
-不正なJSON・IDは400、不存在のGoalは404。業務上の失敗でも、取得できればHTTP 200を返す。
-
 ## Goalを停止する
 
 ```ts
 await env.ORDO.fetch(`https://ordo/_ordo/goals/${goalId}/stop`, { method: "POST" });
 ```
-
-- 有効期限内の未終了Goalを`stopped`にし、以後の進行・結果保存を止める。再要求は冪等で、終了済みGoalは変更しない。
-- 完了済みの成果物と履歴は保持し、未完了工程・実行は`stopped`と表示する。
-- 実行権を取得済みの処理は強制終了せず、DB更新・外部副作用も巻き戻さない。
-- DB移行は不要。利用側の状態判定に`stopped`を追加する。

@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS {{prefix}}goals (
   id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
   input_json TEXT NOT NULL,
+  workflow TEXT NOT NULL DEFAULT 'default',
   status TEXT NOT NULL DEFAULT 'ready',
   created_at INTEGER NOT NULL,
   finished_at INTEGER

@@ -16,6 +16,7 @@ export class Definition<
   Env extends OrdoEnv,
   Params = any,
 > implements OrdoRegistration<Params, Env> {
+  private workflow = "default";
   private expiresIn = 24 * 60 * 60 * 1000;
   private maxIterations = 3;
   private readonly steps = new Map<string, RegisteredStep<Env>>();
@@ -25,7 +26,7 @@ export class Definition<
 
   async start(env: Env, input: unknown): Promise<number> {
     this.ready(env);
-    return startGoal(env.DB, input);
+    return startGoal(env.DB, input, this.workflow);
   }
 
   async list(env: Env) {
@@ -35,6 +36,7 @@ export class Definition<
       this.playbook.flat(),
       this.maxIterations,
       this.expiresIn,
+      this.workflow,
     );
   }
 
@@ -46,13 +48,14 @@ export class Definition<
       id,
       this.maxIterations,
       this.expiresIn,
+      this.workflow,
     );
   }
 
   async stop(env: Env, id: number) {
     this.ready(env);
     await initOrdo(env.DB);
-    await updateGoal(env.DB, id, "stopped", this.expiresIn);
+    await updateGoal(env.DB, id, "stopped", this.expiresIn, this.workflow);
     return this.get(env, id);
   }
 
@@ -69,13 +72,14 @@ export class Definition<
       startedAt,
       this.maxIterations,
       this.expiresIn,
+      this.workflow,
     );
   }
 
   async scheduled(env: Env): Promise<void> {
     this.ready(env);
     await initOrdo(env.DB);
-    const goals = await listPendingGoals(env.DB);
+    const goals = await listPendingGoals(env.DB, this.workflow);
     const failures: unknown[] = [];
     for (const goal of goals) {
       try {
@@ -102,13 +106,17 @@ export class Definition<
       !options ||
       typeof options !== "object" ||
       Object.keys(options).some(
-        (key) => !["expiresIn", "maxIterations"].includes(key),
+        (key) => !["expiresIn", "maxIterations", "workflow"].includes(key),
       )
     ) {
       throw new TypeError(
-        "configure() only accepts expiresIn and maxIterations",
+        "configure() only accepts expiresIn, maxIterations and workflow",
       );
     }
+    const workflow =
+      options.workflow === undefined ? this.workflow : options.workflow;
+    if (typeof workflow !== "string" || !workflow.trim())
+      throw new TypeError("workflow must be a non-empty string");
     const expiresIn = options.expiresIn ?? this.expiresIn;
     const maxIterations = options.maxIterations ?? this.maxIterations;
     if (!Number.isSafeInteger(expiresIn) || expiresIn <= 0) {
@@ -121,6 +129,7 @@ export class Definition<
         "maxIterations must be a positive safe integer including the initial run",
       );
     }
+    this.workflow = workflow;
     this.expiresIn = expiresIn;
     this.maxIterations = maxIterations;
   }

@@ -28,10 +28,11 @@ export function getGoalStatus(
 export async function startGoal(
   db: DatabaseBinding,
   input: unknown,
+  workflow: string,
 ): Promise<number> {
   assertJson(input, "Goal input");
   await initOrdo(db);
-  return (await insertGoal(db, input)).id;
+  return (await insertGoal(db, input, workflow)).id;
 }
 function errorInfo(
   error: { name: string; message: string } | null,
@@ -185,9 +186,10 @@ export async function readGoal(
   id: number,
   maxIterations: number,
   expiresIn: number,
+  workflow: string,
 ): Promise<GoalDetail> {
   await initOrdo(db);
-  const goal = await getGoal(db, id);
+  const goal = await getGoal(db, id, workflow);
   const history = await listAttempts(db, id);
   const result = summary(goal, definitions, history, maxIterations, expiresIn);
   return {
@@ -208,10 +210,11 @@ export async function readGoals(
   definitions: readonly RegisteredStep[],
   maxIterations: number,
   expiresIn: number,
+  workflow: string,
 ): Promise<GoalSummary[]> {
   await initOrdo(db);
-  const goals = await listGoals(db);
-  const history = await listAttempts(db);
+  const goals = await listGoals(db, workflow);
+  const history = await listAttempts(db, undefined, workflow);
   return goals.map((goal) =>
     summary(
       goal,

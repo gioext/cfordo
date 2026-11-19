@@ -41,12 +41,14 @@ async function runDelivery<Env extends OrdoEnv>(
   startedAt: number,
   maxIterations: number,
   expiresIn: number,
+  workflow: string,
 ): Promise<void> {
   const run = await claimDelivery(
     env.DB,
     message.body.deliveryId,
     startedAt,
     expiresIn,
+    workflow,
   );
   if (!run) return;
   let source: ErrorSource = "configuration";
@@ -109,6 +111,7 @@ export async function consumeQueue<Env extends OrdoEnv>(
   startedAt: number,
   maxIterations: number,
   expiresIn: number,
+  workflow: string,
 ): Promise<void> {
   const messages = batch.messages.filter((message) => {
     if (isIntent(message.body)) return true;
@@ -130,6 +133,7 @@ export async function consumeQueue<Env extends OrdoEnv>(
           startedAt,
           maxIterations,
           expiresIn,
+          workflow,
         );
         message.ack();
       } catch (error) {

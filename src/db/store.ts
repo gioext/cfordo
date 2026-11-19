@@ -98,48 +98,65 @@ const activeExecution = `EXISTS (SELECT 1 FROM history h JOIN ${tables.goals} g 
 export async function insertGoal(
   db: DatabaseBinding,
   input: JsonValue,
+  workflow: string,
 ): Promise<Goal> {
   const row = await query(
     db
       .prepare(
         `INSERT INTO ${tables.goals}
-    (input_json,created_at) VALUES (?,?) RETURNING *`,
+    (input_json,created_at,workflow) VALUES (?,?,?) RETURNING *`,
       )
-      .bind(JSON.stringify(input), Date.now())
+      .bind(JSON.stringify(input), Date.now(), workflow)
       .first<GoalRow>(),
   );
   if (!row) throw new Error("Goal creation failed");
   return goal(row);
 }
-export async function listPendingGoals(db: DatabaseBinding): Promise<Goal[]> {
+export async function listPendingGoals(
+  db: DatabaseBinding,
+  workflow: string,
+): Promise<Goal[]> {
   const result = checked(
     await query(
       db
         .prepare(
           `SELECT * FROM ${tables.goals}
-    WHERE status IN ('ready','running') ORDER BY id`,
+    WHERE workflow=? AND status IN ('ready','running') ORDER BY id`,
         )
+        .bind(workflow)
         .all<GoalRow>(),
     ),
   );
   return (result.results ?? []).map(goal);
 }
-export async function listGoals(db: DatabaseBinding): Promise<Goal[]> {
+export async function listGoals(
+  db: DatabaseBinding,
+  workflow: string,
+): Promise<Goal[]> {
   return (
     checked(
       await query(
         db
-          .prepare(`SELECT * FROM ${tables.goals} ORDER BY id DESC`)
+          .prepare(
+            `SELECT * FROM ${tables.goals} WHERE workflow=? ORDER BY id DESC`,
+          )
+          .bind(workflow)
           .all<GoalRow>(),
       ),
     ).results ?? []
   ).map(goal);
 }
-export async function getGoal(db: DatabaseBinding, id: number): Promise<Goal> {
+export async function getGoal(
+  db: DatabaseBinding,
+  id: number,
+  workflow?: string,
+): Promise<Goal> {
   const row = await query(
     db
-      .prepare(`SELECT * FROM ${tables.goals} WHERE id=?`)
-      .bind(id)
+      .prepare(
+        `SELECT * FROM ${tables.goals} WHERE id=?${workflow === undefined ? "" : " AND workflow=?"}`,
+      )
+      .bind(id, ...(workflow === undefined ? [] : [workflow]))
       .first<GoalRow>(),
   );
   if (!row) throw new GoalNotFoundError(id);
@@ -150,6 +167,7 @@ export async function updateGoal(
   id: number,
   status: Exclude<GoalStatus, "ready">,
   expiresIn: number,
+  workflow?: string,
   now = Date.now(),
 ): Promise<void> {
   checked(
@@ -157,9 +175,16 @@ export async function updateGoal(
       db
         .prepare(
           `UPDATE ${tables.goals} SET status=?,finished_at=?
-    WHERE id=? AND status IN ('ready','running') AND created_at+? ${status === "expired" ? "<=" : ">"} ?`,
+    WHERE id=?${workflow === undefined ? "" : " AND workflow=?"} AND status IN ('ready','running') AND created_at+? ${status === "expired" ? "<=" : ">"} ?`,
         )
-        .bind(status, status === "running" ? null : now, id, expiresIn, now)
+        .bind(
+          status,
+          status === "running" ? null : now,
+          id,
+          ...(workflow === undefined ? [] : [workflow]),
+          expiresIn,
+          now,
+        )
         .run(),
     ),
   );
@@ -167,15 +192,20 @@ export async function updateGoal(
 export async function listAttempts(
   db: DatabaseBinding,
   goalId?: number,
+  workflow?: string,
 ): Promise<Attempt[]> {
   const result = checked(
     await query(
       db
         .prepare(
           `${tree} SELECT * FROM history
-    ${goalId === undefined ? "" : "WHERE goal_id=?"} ORDER BY id`,
+    WHERE 1=1 ${goalId === undefined ? "" : "AND goal_id=?"}
+    ${workflow === undefined ? "" : `AND goal_id IN (SELECT id FROM ${tables.goals} WHERE workflow=?)`} ORDER BY id`,
         )
-        .bind(...(goalId === undefined ? [] : [goalId]))
+        .bind(
+          ...(goalId === undefined ? [] : [goalId]),
+          ...(workflow === undefined ? [] : [workflow]),
+        )
         .all<AttemptRow>(),
     ),
   );
@@ -270,6 +300,7 @@ export async function claimDelivery(
   deliveryId: number,
   startedAt: number,
   expiresIn: number,
+  workflow: string,
 ): Promise<Attempt | null> {
   const now = Date.now();
   const result = checked(
@@ -279,11 +310,20 @@ export async function claimDelivery(
           `${tree} INSERT INTO ${tables.attempts}
     (action,predecessor_id,status,created_at)
     SELECT 'run',h.id,'running',? FROM history h JOIN ${tables.goals} g ON g.id=h.goal_id
-    WHERE h.id=? AND h.action IS NULL AND g.status='running' AND g.created_at+?>?
+    WHERE h.id=? AND g.workflow=? AND h.action IS NULL AND g.status='running' AND g.created_at+?>?
     AND h.created_at+${DELIVERY_TIMEOUT}>? AND ?+${EXECUTION_TIMEOUT}>? AND ${currentDelivery}
     ON CONFLICT DO NOTHING RETURNING id`,
         )
-        .bind(startedAt, deliveryId, expiresIn, now, now, startedAt, now)
+        .bind(
+          startedAt,
+          deliveryId,
+          workflow,
+          expiresIn,
+          now,
+          now,
+          startedAt,
+          now,
+        )
         .all<{ id: number }>(),
     ),
   );
