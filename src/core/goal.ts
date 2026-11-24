@@ -1,4 +1,3 @@
-import { invocation } from "./invocation.ts";
 import { initOrdo } from "../db/init.ts";
 import { getGoal, insertGoal, listGoals, listAttempts } from "../db/store.ts";
 import type {
@@ -65,18 +64,13 @@ function execution(
 function stepResult(
   name: string,
   history: Attempt[],
-  definition: RegisteredStep | undefined,
   goalStatus: EffectiveGoalStatus,
   maxIterations: number,
   goalFinishedAt: number | null,
 ): StepResult {
   const active = goalStatus === "ready" || goalStatus === "running";
   // Historical outcomes do not reinterpret a failed Goal using today's improvement limit.
-  const progress = stepProgress(
-    history,
-    definition,
-    active ? maxIterations : Infinity,
-  );
+  const progress = stepProgress(history, active ? maxIterations : Infinity);
   const run = progress.execution.find((item) => item.action === "run");
   const validation = progress.execution.find(
     (item) => item.action === "validate",
@@ -115,48 +109,22 @@ function stepResult(
     finishedAt,
   };
 }
-export async function readResult<T>(
-  db: DatabaseBinding,
-  goalId: number,
-  definition: RegisteredStep,
-  maxIterations: number,
-  expiresIn: number,
-): Promise<T> {
-  const goal = await getGoal(db, goalId);
-  const history = await listAttempts(db, goalId);
-  const result = stepResult(
-    definition.name,
-    history.filter((a) => a.stepName === definition.name),
-    definition,
-    getGoalStatus(goal, expiresIn),
-    maxIterations,
-    goal.finishedAt,
-  );
-  if (result.status !== "completed")
-    throw new Error(
-      `Step ${definition.name} has no completed result in Goal ${goalId}`,
-    );
-  return result.output as T;
-}
 function summary(
   goal: Goal,
-  definitions: RegisteredStep[] | ReadonlyMap<string, RegisteredStep>,
+  definitions: readonly RegisteredStep[],
   history: Attempt[],
   maxIterations: number,
   expiresIn: number,
 ): GoalSummary {
   const status = getGoalStatus(goal, expiresIn);
   const names = new Set([
-    ...(Array.isArray(definitions) ? definitions.map((item) => item.name) : []),
+    ...definitions.map((item) => item.name),
     ...history.map((item) => item.stepName),
   ]);
   const results = [...names].map((name) =>
     stepResult(
       name,
       history.filter((a) => a.stepName === name),
-      Array.isArray(definitions)
-        ? definitions.find((item) => item.name === name)
-        : definitions.get(invocation(name).name),
       status,
       maxIterations,
       goal.finishedAt,
@@ -185,7 +153,7 @@ function summary(
 }
 export async function readGoal(
   db: DatabaseBinding,
-  definitions: RegisteredStep[] | ReadonlyMap<string, RegisteredStep>,
+  definitions: readonly RegisteredStep[],
   id: number,
   maxIterations: number,
   expiresIn: number,
@@ -210,7 +178,7 @@ export async function readGoal(
 }
 export async function readGoals(
   db: DatabaseBinding,
-  definitions: RegisteredStep[] | ReadonlyMap<string, RegisteredStep>,
+  definitions: readonly RegisteredStep[],
   maxIterations: number,
   expiresIn: number,
   workflow: string,

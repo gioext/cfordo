@@ -1,5 +1,4 @@
-import { invocation } from "./invocation.ts";
-import { saveOutcome } from "../db/store.ts";
+import { listAttempts, saveOutcome } from "../db/store.ts";
 import type {
   Action,
   Attempt,
@@ -7,9 +6,8 @@ import type {
   JsonValue,
   OrdoContext,
   OrdoEnv,
-  RegisteredStep,
 } from "../types.ts";
-import { readResult } from "./goal.ts";
+import { completedResult } from "./progress.ts";
 import { assertJson } from "./validation.ts";
 
 export function createContext<Env extends OrdoEnv>(
@@ -18,7 +16,6 @@ export function createContext<Env extends OrdoEnv>(
   stepName: string,
   params: JsonValue,
   feedback: ImprovementFeedback,
-  definitions: ReadonlyMap<string, RegisteredStep<Env>>,
   maxIterations: number,
   expiresIn: number,
 ) {
@@ -40,14 +37,11 @@ export function createContext<Env extends OrdoEnv>(
       });
     },
     async result<T = any>(name: string): Promise<T> {
-      const definition = definitions.get(invocation(name).name);
-      if (!definition) throw new Error(`Step not registered: ${name}`);
-      return readResult<T>(
-        env.DB,
+      return completedResult<T>(
+        await listAttempts(env.DB, goalId),
+        name,
         goalId,
-        { ...definition, name },
         maxIterations,
-        expiresIn,
       );
     },
     async complete(value: unknown): Promise<void> {

@@ -48,11 +48,34 @@ const sum = ordo.step<Result>({
   },
 });
 
-ordo.plan(async ({ input, step, parallel }) => {
-  const results = await parallel([step(double, input), step(square, input)]);
-  await step(sum, input);
-  if (input.additionalSquares) {
-    await parallel(results.map((result) => step(square, result)));
+const totalSquares = ordo.step<Result, string[]>({
+  name: "total-squares",
+  run: async (ctx) => {
+    const values = await Promise.all(
+      ctx.input().params.map((name) => ctx.result<Result>(name)),
+    );
+    await ctx.complete({
+      value: values.reduce((sum, item) => sum + item.value, 0),
+    });
+  },
+});
+
+ordo.plan(async (ctx) => {
+  await ctx.parallel([
+    ctx.step(double, ctx.input),
+    ctx.step(square, ctx.input),
+  ]);
+  await ctx.step(sum, ctx.input);
+  if (ctx.input.additionalSquares) {
+    const inputs = await Promise.all(
+      ["double", "square"].map((name) => ctx.result<Result>(name)),
+    );
+    const values = [...new Set(inputs.map((item) => item.value))];
+    const name = (value: number) => `square-${value}`;
+    await ctx.parallel(
+      values.map((value) => ctx.step(name(value), square, { value })),
+    );
+    await ctx.step(totalSquares, values.map(name));
   }
 });
 

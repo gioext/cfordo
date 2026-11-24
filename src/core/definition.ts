@@ -43,7 +43,7 @@ export class Definition<
     this.ready(env);
     return readGoals(
       env.DB,
-      this.workflowPlan ? this.steps : this.playbook.flat(),
+      this.workflowPlan ? [] : this.playbook.flat(),
       this.maxIterations,
       this.expiresIn,
       this.workflow,
@@ -54,7 +54,7 @@ export class Definition<
     this.ready(env);
     return readGoal(
       env.DB,
-      this.workflowPlan ? this.steps : this.playbook.flat(),
+      this.workflowPlan ? [] : this.playbook.flat(),
       id,
       this.maxIterations,
       this.expiresIn,

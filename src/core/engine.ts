@@ -1,11 +1,12 @@
 import { SCHEMA_VERSION } from "../db/schema.ts";
 import { reserveDispatch } from "../db/store.ts";
-import type { Attempt, OrdoEnv } from "../types.ts";
+import type { Attempt, OrdoEnv, JsonValue } from "../types.ts";
 
 export async function dispatchStep(
   env: OrdoEnv,
   goalId: number,
   stepName: string,
+  instruction: JsonValue | undefined,
   delivery: Attempt | undefined,
   last: Attempt | undefined,
   recover: boolean,
@@ -15,6 +16,7 @@ export async function dispatchStep(
     env.DB,
     goalId,
     stepName,
+    instruction,
     delivery,
     last,
     recover,

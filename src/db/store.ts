@@ -231,23 +231,26 @@ export async function reserveDispatch(
   db: DatabaseBinding,
   goalId: number,
   stepName: string,
+  instruction: JsonValue | undefined,
   delivery: Attempt | undefined,
   last: Attempt | undefined,
   recover: boolean,
   expiresIn: number,
 ): Promise<number | null> {
   const now = Date.now();
+  const payload =
+    instruction === undefined ? null : JSON.stringify(instruction);
   if (!delivery) {
     const result = checked(
       await query(
         db
           .prepare(
             `INSERT INTO ${tables.attempts}
-      (goal_id,step_name,created_at) SELECT id,?,? FROM ${tables.goals}
+      (goal_id,step_name,created_at,output_json) SELECT id,?,?,? FROM ${tables.goals}
       WHERE id=? AND status='running' AND created_at+?>?
       ON CONFLICT DO NOTHING RETURNING id`,
           )
-          .bind(stepName, now, goalId, expiresIn, now)
+          .bind(stepName, now, payload, goalId, expiresIn, now)
           .all<{ id: number }>(),
       ),
     );
@@ -277,13 +280,14 @@ export async function reserveDispatch(
   statements.push(
     db
       .prepare(
-        `${tree} INSERT INTO ${tables.attempts} (predecessor_id,created_at)
-    SELECT d.id,? FROM history d JOIN ${tables.goals} g ON g.id=d.goal_id
+        `${tree} INSERT INTO ${tables.attempts} (predecessor_id,created_at,output_json)
+    SELECT d.id,?,? FROM history d JOIN ${tables.goals} g ON g.id=d.goal_id
     WHERE d.id=? AND d.action IS NULL AND g.status='running' AND g.created_at+?>?
     AND ${condition} ON CONFLICT DO NOTHING RETURNING id`,
       )
       .bind(
         now,
+        payload,
         delivery.id,
         expiresIn,
         now,

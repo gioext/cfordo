@@ -56,10 +56,14 @@ async function runDelivery<Env extends OrdoEnv>(
   let current: Attempt = run;
   try {
     const goal = await getGoal(env.DB, run.goalId);
-    const target = invocation(run.stepName);
-    const definition = definitions.get(target.name);
-    if (!definition) throw new Error(`Step not registered: ${run.stepName}`);
     const history = await listAttempts(env.DB, goal.id);
+    const delivery = history.find((a) => a.id === run.deliveryId)!;
+    const target =
+      delivery.output === undefined
+        ? invocation(run.stepName)
+        : (delivery.output as { name?: string; params?: JsonValue });
+    const definition = definitions.get(target.name ?? run.stepName);
+    if (!definition) throw new Error(`Step not registered: ${run.stepName}`);
     const shared = createContext(
       env,
       goal.id,
@@ -70,7 +74,6 @@ async function runDelivery<Env extends OrdoEnv>(
           (a) => a.stepName === run.stepName && a.id < run.deliveryId,
         ),
       ),
-      definitions,
       maxIterations,
       expiresIn,
     );

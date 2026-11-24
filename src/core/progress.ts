@@ -46,7 +46,6 @@ export function feedback(history: readonly Attempt[]) {
 }
 export function stepProgress(
   history: readonly Attempt[],
-  definition: RegisteredStep | undefined,
   maxIterations: number,
   now = Date.now(),
 ) {
@@ -77,10 +76,7 @@ export function stepProgress(
       dispatch = "improve";
       action = "run";
     }
-  } else if (
-    last?.status === "completed" &&
-    followingAction(last, definition) === null
-  ) {
+  } else if (last?.status === "completed") {
     status = "completed";
     action = null;
     finishedAt = last.finishedAt;
@@ -104,4 +100,22 @@ export function stepProgress(
     rejected,
     finishedAt,
   };
+}
+
+// finishAttempt commits phase completion and any successor in one D1 batch.
+export function completedResult<T>(
+  history: Attempt[],
+  name: string,
+  goalId: number,
+  maxIterations: number,
+): T {
+  const progress = stepProgress(
+    history.filter((a) => a.stepName === name),
+    maxIterations,
+  );
+  if (progress.status !== "completed")
+    throw new Error(`Step ${name} has no completed result in Goal ${goalId}`);
+  return structuredClone(
+    progress.execution.find((a) => a.action === "run")!.output,
+  ) as T;
 }

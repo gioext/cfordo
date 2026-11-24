@@ -56,19 +56,24 @@ Use Wrangler-generated binding types for `Env`. `run` is required; `validate` an
 Replace the plan above to select subsequent steps from a completed result.
 
 ```ts
-ordo.plan(async ({ input, step, parallel }) => {
-  const first = await step(double, input);
+ordo.plan(async ctx => {
+  await ctx.step(double, ctx.input);
+  const first = await ctx.result<{ value: number }>("double");
   if (first.value > 10) {
-    await parallel([first.value, first.value + 1].map(value =>
-      step(double, { value })
+    await ctx.parallel([first.value, first.value + 1].map(value =>
+      ctx.step(`double-${value}`, double, { value })
     ));
+    const next = await ctx.result<{ value: number }>(`double-${first.value}`);
+    // ...
   }
 });
 ```
 
-Register one callback per workflow. On each advance the planner calls it from the beginning, returning stored results for completed calls and yielding at pending steps. `parallel()` returns results in argument order and accepts an empty array.
+Register one callback per workflow. The planner evaluates it from the beginning on each advance and yields at pending steps. Both `await ctx.step()` and `await ctx.parallel()` return void. In the plan and in Worker handlers, use `await ctx.result(name)` to read the completed result in the same Goal. An unknown or incomplete step raises an error.
 
-Read current data via `env` in the callback. Put side effects in step handlers and let exceptions from step calls propagate. Step names beginning with `@plan:` are reserved. Within a Goal, a handler name and JSON input identify one step. Include a candidate ID in the input to distinguish different targets. Per-step arguments appear in step names in the history API.
+Use `step(name, definition, params)` to give each target a unique name within the Goal. Omitting the name uses the registered definition name. Calls with the same name refer to the same work. Use a different name when a target needs fresh processing. Arguments must be JSON values. The plan may read current data via `ctx.env`. Put side effects in Worker handlers and let step exceptions propagate from the plan.
+
+When migrating from 0.6.0, replace uses of step return values with `ctx.result()` and explicitly name steps with individual arguments. Finish Goals using the old plan before changing step names, as a new name identifies different work.
 
 ## Configure improvements and expiration
 

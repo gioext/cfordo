@@ -88,8 +88,14 @@ export interface OrdoOptions {
 export type Plan<Params, Env extends OrdoEnv> = (ctx: {
   env: Env;
   input: Params;
-  step<P, R>(definition: StepDefinition<P, R, Env>, params: P): Promise<R>;
-  parallel<T>(steps: readonly Promise<T>[]): Promise<T[]>;
+  step<P>(definition: StepDefinition<P, any, Env>, params: P): Promise<void>;
+  step<P>(
+    name: string,
+    definition: StepDefinition<P, any, Env>,
+    params: P,
+  ): Promise<void>;
+  result<T = any>(name: string): Promise<T>;
+  parallel(steps: readonly Promise<void>[]): Promise<void>;
 }) => Promise<void>;
 
 export interface OrdoRegistration<Params = any, Env extends OrdoEnv = OrdoEnv> {

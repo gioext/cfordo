@@ -52,19 +52,24 @@ export default ordo;
 上の `plan()` を次のように変更すると、最初の結果に応じて後続工程を組み立てられます。
 
 ```ts
-ordo.plan(async ({ input, step, parallel }) => {
-  const first = await step(double, input);
+ordo.plan(async ctx => {
+  await ctx.step(double, ctx.input);
+  const first = await ctx.result<{ value: number }>("double");
   if (first.value > 10) {
-    await parallel([first.value, first.value + 1].map(value =>
-      step(double, { value })
+    await ctx.parallel([first.value, first.value + 1].map(value =>
+      ctx.step(`double-${value}`, double, { value })
     ));
+    const next = await ctx.result<{ value: number }>(`double-${first.value}`);
+    // ...
   }
 });
 ```
 
-workflowごとに1つのcallbackを登録します。plannerは進行時にcallbackを先頭から呼び、完了済みのstepでは保存済みの結果を返します。未完了のstepで今回の進行を区切ります。`parallel()` は各stepの結果を指定順に返し、空配列も受け付けます。
+workflowごとにcallbackを1つ登録します。plannerは進行時に先頭から評価し、未完了の工程で今回の進行を区切ります。`await ctx.step()` と `await ctx.parallel()` の戻り値はvoidです。planとWorkerのどちらでも、同じGoalの確定結果を `await ctx.result(工程名)` で取得します。未確定・未知の工程名はエラーになります。
 
-callbackは `env` から現在のDBを読めます。副作用はstepの `run` に置き、stepの待機を示す例外をcallbackで捕捉しないでください。工程名の先頭の `@plan:` は予約されています。同じGoalで処理名とJSON入力が同じ呼び出しは1つのstepです。別の対象には候補IDなどを入力に含めます。個別入力は工程名にも含まれ、APIの履歴に表示されます。
+`step(工程名, 処理定義, 入力)` の工程名はGoal内で対象ごとに一意にします。省略時は処理定義の登録名を使います。同じ名前は同じ工程として扱われるので、再判定が必要な対象には別の名前を付けます。入力はJSON値です。planは `ctx.env` から現在のDBを読めます。副作用はWorkerの工程に置き、plan内のstep呼び出しの例外はそのまま伝播させてください。
+
+0.6.0から移行する場合は、stepの戻り値を参照している箇所を `ctx.result()` に変更し、個別入力の工程に明示的な名前を付けます。進行中のGoalで工程名を変更すると別工程になるため、切り替え前に旧planのGoalを完了させます。
 
 ## 改善と期限の設定
 
