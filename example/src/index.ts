@@ -1,34 +1,32 @@
 import { Ordo } from "cfordo";
 
-type Params = { value: number };
+type Params = { value: number; additionalSquares?: boolean };
 type Result = { value: number };
 
 const ordo = new Ordo<Env, Params>();
 
-await ordo.parallel(async () => {
-  ordo.step<Result>({
-    name: "double",
-    run: async (ctx) => ctx.complete({ value: ctx.input().params.value * 2 }),
-    validate: async (ctx) =>
-      Number.isFinite(ctx.input().result.value) ? ctx.ok() : ctx.ng("非有限"),
-    evaluate: async (ctx) =>
-      ctx.input().result.value === ctx.input().params.value * 2
-        ? ctx.ok()
-        : ctx.ng("2倍と不一致"),
-  });
-  ordo.step<Result>({
-    name: "square",
-    run: async (ctx) => ctx.complete({ value: ctx.input().params.value ** 2 }),
-    validate: async (ctx) =>
-      Number.isFinite(ctx.input().result.value) ? ctx.ok() : ctx.ng("非有限"),
-    evaluate: async (ctx) =>
-      ctx.input().result.value === ctx.input().params.value ** 2
-        ? ctx.ok()
-        : ctx.ng("2乗と不一致"),
-  });
+const double = ordo.step<Result>({
+  name: "double",
+  run: async (ctx) => ctx.complete({ value: ctx.input().params.value * 2 }),
+  validate: async (ctx) =>
+    Number.isFinite(ctx.input().result.value) ? ctx.ok() : ctx.ng("非有限"),
+  evaluate: async (ctx) =>
+    ctx.input().result.value === ctx.input().params.value * 2
+      ? ctx.ok()
+      : ctx.ng("2倍と不一致"),
+});
+const square = ordo.step<Result>({
+  name: "square",
+  run: async (ctx) => ctx.complete({ value: ctx.input().params.value ** 2 }),
+  validate: async (ctx) =>
+    Number.isFinite(ctx.input().result.value) ? ctx.ok() : ctx.ng("非有限"),
+  evaluate: async (ctx) =>
+    ctx.input().result.value === ctx.input().params.value ** 2
+      ? ctx.ok()
+      : ctx.ng("2乗と不一致"),
 });
 
-ordo.step<Result>({
+const sum = ordo.step<Result>({
   name: "sum",
   run: async (ctx) => {
     const [double, square] = await Promise.all([
@@ -48,6 +46,14 @@ ordo.step<Result>({
       ? ctx.ok()
       : ctx.ng("合計が不一致");
   },
+});
+
+ordo.plan(async ({ input, step, parallel }) => {
+  const results = await parallel([step(double, input), step(square, input)]);
+  await step(sum, input);
+  if (input.additionalSquares) {
+    await parallel(results.map((result) => step(square, result)));
+  }
 });
 
 export default ordo;

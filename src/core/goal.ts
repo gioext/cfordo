@@ -1,3 +1,4 @@
+import { invocation } from "./invocation.ts";
 import { initOrdo } from "../db/init.ts";
 import { getGoal, insertGoal, listGoals, listAttempts } from "../db/store.ts";
 import type {
@@ -139,21 +140,23 @@ export async function readResult<T>(
 }
 function summary(
   goal: Goal,
-  definitions: readonly RegisteredStep[],
+  definitions: RegisteredStep[] | ReadonlyMap<string, RegisteredStep>,
   history: Attempt[],
   maxIterations: number,
   expiresIn: number,
 ): GoalSummary {
   const status = getGoalStatus(goal, expiresIn);
   const names = new Set([
-    ...definitions.map((item) => item.name),
+    ...(Array.isArray(definitions) ? definitions.map((item) => item.name) : []),
     ...history.map((item) => item.stepName),
   ]);
   const results = [...names].map((name) =>
     stepResult(
       name,
       history.filter((a) => a.stepName === name),
-      definitions.find((item) => item.name === name),
+      Array.isArray(definitions)
+        ? definitions.find((item) => item.name === name)
+        : definitions.get(invocation(name).name),
       status,
       maxIterations,
       goal.finishedAt,
@@ -182,7 +185,7 @@ function summary(
 }
 export async function readGoal(
   db: DatabaseBinding,
-  definitions: readonly RegisteredStep[],
+  definitions: RegisteredStep[] | ReadonlyMap<string, RegisteredStep>,
   id: number,
   maxIterations: number,
   expiresIn: number,
@@ -207,7 +210,7 @@ export async function readGoal(
 }
 export async function readGoals(
   db: DatabaseBinding,
-  definitions: readonly RegisteredStep[],
+  definitions: RegisteredStep[] | ReadonlyMap<string, RegisteredStep>,
   maxIterations: number,
   expiresIn: number,
   workflow: string,

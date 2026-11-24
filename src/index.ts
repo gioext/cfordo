@@ -18,6 +18,7 @@ export type {
   OrdoContext,
   OrdoEnv,
   OrdoOptions,
+  Plan,
   StepDefinition,
   StepResult,
 } from "./types.ts";

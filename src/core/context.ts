@@ -1,3 +1,4 @@
+import { invocation } from "./invocation.ts";
 import { saveOutcome } from "../db/store.ts";
 import type {
   Action,
@@ -39,12 +40,12 @@ export function createContext<Env extends OrdoEnv>(
       });
     },
     async result<T = any>(name: string): Promise<T> {
-      const definition = definitions.get(name);
+      const definition = definitions.get(invocation(name).name);
       if (!definition) throw new Error(`Step not registered: ${name}`);
       return readResult<T>(
         env.DB,
         goalId,
-        definition,
+        { ...definition, name },
         maxIterations,
         expiresIn,
       );

@@ -1,6 +1,6 @@
 import { createApi } from "./api.ts";
 import { Definition } from "./core/definition.ts";
-import type { OrdoEnv, OrdoOptions, StepDefinition } from "./types.ts";
+import type { OrdoEnv, OrdoOptions, Plan, StepDefinition } from "./types.ts";
 
 export class Ordo<
   Env extends OrdoEnv = OrdoEnv,
@@ -17,8 +17,11 @@ export class Ordo<
   configure(options: OrdoOptions): void {
     this.definition.configure(options);
   }
-  step<Result = any>(step: StepDefinition<Params, Result, Env>): void {
-    this.definition.step(step);
+  plan(callback: Plan<Params, Env>): void {
+    this.definition.plan(callback);
+  }
+  step<Result = any, P = Params>(step: StepDefinition<P, Result, Env>) {
+    return this.definition.step(step);
   }
   parallel(callback: () => Promise<void>): Promise<void> {
     return this.definition.parallel(callback);

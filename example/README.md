@@ -1,6 +1,7 @@
 # cfordo example
 
 `double`・`square`を並列実行し、両方の検証・評価が成功した後に`sum`で結果を合計するexample。
+入力に `additionalSquares: true` を指定すると、先行2工程の確定結果それぞれを入力として追加のsquareを並列実行する。
 実装は[src/index.ts](src/index.ts)、ライブラリの使い方は[ルートREADME](../README.ja.md)を参照。
 
 ## 準備
@@ -74,6 +75,7 @@ pnpm --filter @cfordo/example exec wrangler d1 execute example-ordo-db --remote 
 | 11   | 22     | 121    | 143 |
 | 23   | 46     | 529    | 575 |
 
+- 入力 `{"value":3,"additionalSquares":true}` は、6・9を得てsumが15となり、追加のsquareは36・81となる。5工程の履歴は計15件。
 - 各POSTがHTTP 202と異なる数値のGoal IDを返し、別Goalの入力・結果が混ざらない。3工程の検証・評価とGoal全体が成功する。
 - 各工程の履歴はrun・validate・evaluateの3件、Goalごとに計9件。検証・評価の`sourceRunId`が対応するrunを指す。sumは先行2工程の検証・評価完了後に始まり、runとevaluateでD1の両結果を取得する。
 - 一覧はGoal ID降順で、入力・状態・工程別結果が詳細と一致し、`executions`を含まない。後続工程も同じ確定結果を使い、採用しなかった実行も詳細の履歴に残る。

@@ -6,6 +6,7 @@ import { initOrdo } from "../db/init.ts";
 import type {
   OrdoEnv,
   OrdoOptions,
+  Plan,
   OrdoRegistration,
   RegisteredStep,
   StepDefinition,
@@ -23,6 +24,15 @@ export class Definition<
   private readonly playbook: RegisteredStep<Env>[][] = [];
   private group: RegisteredStep<Env>[] | null = null;
   private frozen = false;
+  private workflowPlan?: Plan<Params, Env>;
+
+  plan(callback: Plan<Params, Env>): void {
+    this.assertMutable();
+    if (typeof callback !== "function")
+      throw new TypeError("plan requires a callback");
+    if (this.workflowPlan) throw new Error("Workflow plan already registered");
+    this.workflowPlan = callback;
+  }
 
   async start(env: Env, input: unknown): Promise<number> {
     this.ready(env);
@@ -33,7 +43,7 @@ export class Definition<
     this.ready(env);
     return readGoals(
       env.DB,
-      this.playbook.flat(),
+      this.workflowPlan ? this.steps : this.playbook.flat(),
       this.maxIterations,
       this.expiresIn,
       this.workflow,
@@ -44,7 +54,7 @@ export class Definition<
     this.ready(env);
     return readGoal(
       env.DB,
-      this.playbook.flat(),
+      this.workflowPlan ? this.steps : this.playbook.flat(),
       id,
       this.maxIterations,
       this.expiresIn,
@@ -86,7 +96,8 @@ export class Definition<
         await runPlanner(
           env,
           goal.id,
-          this.playbook,
+          this.workflowPlan ?? this.playbook,
+          this.steps,
           this.maxIterations,
           this.expiresIn,
         );
@@ -134,7 +145,9 @@ export class Definition<
     this.maxIterations = maxIterations;
   }
 
-  step<Result = any>(definition: StepDefinition<Params, Result, Env>): void {
+  step<Result = any, P = Params>(
+    definition: StepDefinition<P, Result, Env>,
+  ): StepDefinition<P, Result, Env> {
     this.assertMutable();
     if (
       !definition ||
@@ -144,6 +157,8 @@ export class Definition<
     ) {
       throw new TypeError("Step requires a name and run function");
     }
+    if (definition.name.startsWith("@plan:"))
+      throw new Error("Reserved step name prefix @plan:");
     if (this.steps.has(definition.name))
       throw new Error(`Step already registered: ${definition.name}`);
     if (
@@ -167,6 +182,7 @@ export class Definition<
     this.steps.set(registered.name, registered);
     if (this.group) this.group.push(registered);
     else this.playbook.push([registered]);
+    return registered;
   }
 
   ready(env: Env): void {
@@ -178,7 +194,8 @@ export class Definition<
       typeof env?.QUEUE?.send !== "function"
     )
       throw new TypeError("Ordo requires DB and QUEUE bindings");
-    if (!this.steps.size) throw new Error("At least one Step is required");
+    if (!this.workflowPlan && !this.steps.size)
+      throw new Error("At least one Step is required");
     this.frozen = true;
   }
 

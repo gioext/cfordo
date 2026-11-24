@@ -85,9 +85,19 @@ export interface OrdoOptions {
   maxIterations?: number;
 }
 
+export type Plan<Params, Env extends OrdoEnv> = (ctx: {
+  env: Env;
+  input: Params;
+  step<P, R>(definition: StepDefinition<P, R, Env>, params: P): Promise<R>;
+  parallel<T>(steps: readonly Promise<T>[]): Promise<T[]>;
+}) => Promise<void>;
+
 export interface OrdoRegistration<Params = any, Env extends OrdoEnv = OrdoEnv> {
   configure(options: OrdoOptions): void;
-  step<Result = any>(definition: StepDefinition<Params, Result, Env>): void;
+  plan(callback: Plan<Params, Env>): void;
+  step<Result = any, P = Params>(
+    definition: StepDefinition<P, Result, Env>,
+  ): StepDefinition<P, Result, Env>;
   parallel(callback: () => Promise<void>): Promise<void>;
 }
 

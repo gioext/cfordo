@@ -1,3 +1,4 @@
+import { invocation } from "./invocation.ts";
 import { SCHEMA_VERSION } from "../db/schema.ts";
 import { initOrdo } from "../db/init.ts";
 import {
@@ -55,14 +56,15 @@ async function runDelivery<Env extends OrdoEnv>(
   let current: Attempt = run;
   try {
     const goal = await getGoal(env.DB, run.goalId);
-    const definition = definitions.get(run.stepName);
+    const target = invocation(run.stepName);
+    const definition = definitions.get(target.name);
     if (!definition) throw new Error(`Step not registered: ${run.stepName}`);
     const history = await listAttempts(env.DB, goal.id);
     const shared = createContext(
       env,
       goal.id,
       run.stepName,
-      goal.input,
+      target.params === undefined ? goal.input : target.params,
       feedback(
         history.filter(
           (a) => a.stepName === run.stepName && a.id < run.deliveryId,

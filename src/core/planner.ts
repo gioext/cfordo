@@ -1,5 +1,6 @@
+import { invocationName } from "./invocation.ts";
 import { getGoal, listAttempts, updateGoal } from "../db/store.ts";
-import type { OrdoEnv, Playbook } from "../types.ts";
+import type { OrdoEnv, Plan, RegisteredStep, Playbook } from "../types.ts";
 import { dispatchStep } from "./engine.ts";
 import { getGoalStatus } from "./goal.ts";
 import { stepProgress } from "./progress.ts";
@@ -7,7 +8,8 @@ import { stepProgress } from "./progress.ts";
 export async function runPlanner<Env extends OrdoEnv>(
   env: Env,
   goalId: number,
-  playbook: Playbook<Env>,
+  plan: Playbook<Env> | Plan<any, Env>,
+  definitions: ReadonlyMap<string, RegisteredStep<Env>>,
   maxIterations: number,
   expiresIn: number,
 ): Promise<void> {
@@ -20,37 +22,78 @@ export async function runPlanner<Env extends OrdoEnv>(
   if (goal.status === "ready")
     await updateGoal(env.DB, goalId, "running", expiresIn);
   const history = await listAttempts(env.DB, goalId);
-  for (const group of playbook) {
-    const steps = group.map((definition) => ({
+  const waiting = Symbol();
+  const pending = new Map<string, ReturnType<typeof stepProgress>>();
+  function inspect(name: string, definition: RegisteredStep<Env>) {
+    const progress = stepProgress(
+      history.filter((a) => a.stepName === name),
       definition,
-      progress: stepProgress(
-        history.filter((a) => a.stepName === definition.name),
-        definition,
-        maxIterations,
-      ),
-    }));
-    if (steps.some((s) => s.progress.status === "failed")) {
+      maxIterations,
+    );
+    if (progress.status === "completed")
+      return structuredClone(
+        progress.execution.find((a) => a.action === "run")!.output,
+      );
+    pending.set(name, progress);
+    throw waiting;
+  }
+
+  try {
+    if (typeof plan === "function") {
+      await plan({
+        input: structuredClone(goal.input),
+        env,
+        async step(definition, params) {
+          if (definitions.get(definition.name) !== definition)
+            throw new Error("Use the step definition returned by ordo.step()");
+          return inspect(
+            invocationName(definition.name, params, goal.input),
+            definition,
+          ) as any;
+        },
+        async parallel(steps) {
+          const results = await Promise.allSettled(steps);
+          for (const result of results)
+            if (result.status === "rejected" && result.reason !== waiting)
+              throw result.reason;
+          return results.map((result) => {
+            if (result.status === "rejected") throw result.reason;
+            return result.value;
+          });
+        },
+      });
+    } else {
+      for (const group of plan)
+        await Promise.all(group.map(async (def) => inspect(def.name, def)));
+    }
+  } catch (error) {
+    if (error !== waiting) {
+      console.error("Workflow plan failed", { goalId, error });
       await updateGoal(env.DB, goalId, "failed", expiresIn);
       return;
     }
-    if (steps.every((s) => s.progress.status === "completed")) continue;
-    const dispatched = await Promise.allSettled(
-      steps
-        .filter((s) => s.progress.dispatch)
-        .map((s) =>
-          dispatchStep(
+  }
+  if ([...pending.values()].some((progress) => progress.status === "failed")) {
+    await updateGoal(env.DB, goalId, "failed", expiresIn);
+    return;
+  }
+  if (pending.size) {
+    const deliveries = await Promise.allSettled(
+      [...pending].map(async ([name, progress]) => {
+        if (progress.dispatch)
+          await dispatchStep(
             env,
             goalId,
-            s.definition.name,
-            s.progress.delivery,
-            s.progress.last,
-            s.progress.dispatch === "recover",
+            name,
+            progress.delivery,
+            progress.last,
+            progress.dispatch === "recover",
             expiresIn,
-          ),
-        ),
+          );
+      }),
     );
-    const failure = dispatched.find((r) => r.status === "rejected");
-    if (failure?.status === "rejected") throw failure.reason;
+    for (const result of deliveries)
+      if (result.status === "rejected") throw result.reason;
     return;
   }
   await updateGoal(env.DB, goalId, "completed", expiresIn);

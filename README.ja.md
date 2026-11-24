@@ -16,7 +16,7 @@ import { Ordo } from "cfordo";
 type Params = { value: number };
 const ordo = new Ordo<Env, Params>();
 
-ordo.step<{ value: number }>({
+const double = ordo.step<{ value: number }>({
   name: "double",
   run: async (ctx) => ctx.complete({ value: ctx.input().params.value * 2 }),
   validate: async (ctx) =>
@@ -27,6 +27,10 @@ ordo.step<{ value: number }>({
       : ctx.ng("2倍と不一致"),
 });
 
+ordo.plan(async ({ input, step }) => {
+  await step(double, input);
+});
+
 export default ordo;
 ```
 
@@ -34,7 +38,7 @@ export default ordo;
 
 | API                                             | 用途                                              |
 | ----------------------------------------------- | ------------------------------------------------- |
-| `ctx.input().params`                            | Goalの起動入力                                    |
+| `ctx.input().params`                            | そのstepに渡した入力                                    |
 | `ctx.input().result`                            | 検証・評価の対象runの結果                         |
 | `await ctx.complete(data)`                      | runの結果を保存                                   |
 | `await ctx.ok()` / `await ctx.ng(reason)`       | 検証・評価の判定を保存                            |
@@ -43,36 +47,24 @@ export default ordo;
 | `ctx.feedback`                                  | 改善周回の`iteration`と前回NGの`source`・`reason` |
 | `ctx.goalId` / `ctx.stepName` / `ctx.attemptId` | 現在のGoal・工程・実行の識別子                    |
 
-## 並列実行と工程間の参照
+## 動的な直列・並列工程
 
-並列に実行する工程は`ordo.parallel()`で囲む。
-後続工程では、変数や戻り値を共有せず`ctx.result()`で先行工程の結果を取得する。
+上の `plan()` を次のように変更すると、最初の結果に応じて後続工程を組み立てられます。
 
 ```ts
-await ordo.parallel(async () => {
-  ordo.step<{ value: number }>({
-    name: "double",
-    run: async (ctx) => ctx.complete({ value: ctx.input().params.value * 2 }),
-  });
-  ordo.step<{ value: number }>({
-    name: "square",
-    run: async (ctx) => ctx.complete({ value: ctx.input().params.value ** 2 }),
-  });
-});
-
-ordo.step<{ value: number }>({
-  name: "sum",
-  run: async (ctx) => {
-    const [double, square] = await Promise.all([
-      ctx.result<{ value: number }>("double"),
-      ctx.result<{ value: number }>("square"),
-    ]);
-    await ctx.complete({ value: double.value + square.value });
-  },
+ordo.plan(async ({ input, step, parallel }) => {
+  const first = await step(double, input);
+  if (first.value > 10) {
+    await parallel([first.value, first.value + 1].map(value =>
+      step(double, { value })
+    ));
+  }
 });
 ```
 
-上記は最初の`double`定義を置き換える例。全工程に検証・評価を付けた[example](example/src/index.ts)も参照できる。
+workflowごとに1つのcallbackを登録します。plannerは進行時にcallbackを先頭から呼び、完了済みのstepでは保存済みの結果を返します。未完了のstepで今回の進行を区切ります。`parallel()` は各stepの結果を指定順に返し、空配列も受け付けます。
+
+callbackは `env` から現在のDBを読めます。副作用はstepの `run` に置き、stepの待機を示す例外をcallbackで捕捉しないでください。工程名の先頭の `@plan:` は予約されています。同じGoalで処理名とJSON入力が同じ呼び出しは1つのstepです。別の対象には候補IDなどを入力に含めます。個別入力は工程名にも含まれ、APIの履歴に表示されます。
 
 ## 改善と期限の設定
 

@@ -18,7 +18,7 @@ import { Ordo } from "cfordo";
 type Params = { value: number };
 const ordo = new Ordo<Env, Params>();
 
-ordo.step<{ value: number }>({
+const double = ordo.step<{ value: number }>({
   name: "double",
   run: async (ctx) => ctx.complete({ value: ctx.input().params.value * 2 }),
   validate: async (ctx) =>
@@ -31,6 +31,10 @@ ordo.step<{ value: number }>({
       : ctx.ng("Does not equal twice the input"),
 });
 
+ordo.plan(async ({ input, step }) => {
+  await step(double, input);
+});
+
 export default ordo;
 ```
 
@@ -38,7 +42,7 @@ Use Wrangler-generated binding types for `Env`. `run` is required; `validate` an
 
 | API                                             | Purpose                                                                           |
 | ----------------------------------------------- | --------------------------------------------------------------------------------- |
-| `ctx.input().params`                            | Goal input                                                                        |
+| `ctx.input().params`                            | Input passed to this step                                                                        |
 | `ctx.input().result`                            | The run output being validated or evaluated                                       |
 | `await ctx.complete(data)`                      | Save a run's result                                                               |
 | `await ctx.ok()` / `await ctx.ng(reason)`       | Save a check verdict                                                              |
@@ -47,36 +51,24 @@ Use Wrangler-generated binding types for `Env`. `run` is required; `validate` an
 | `ctx.feedback`                                  | Improvement `iteration` and the previous negative verdict's `source` and `reason` |
 | `ctx.goalId` / `ctx.stepName` / `ctx.attemptId` | Current Goal, step, and execution identifiers                                     |
 
-## Parallel steps and shared results
+## Dynamic sequential and parallel steps
 
-Wrap parallel steps in `ordo.parallel()`.
-Use `ctx.result()` to obtain prior steps' results instead of sharing variables or return values.
+Replace the plan above to select subsequent steps from a completed result.
 
 ```ts
-await ordo.parallel(async () => {
-  ordo.step<{ value: number }>({
-    name: "double",
-    run: async (ctx) => ctx.complete({ value: ctx.input().params.value * 2 }),
-  });
-  ordo.step<{ value: number }>({
-    name: "square",
-    run: async (ctx) => ctx.complete({ value: ctx.input().params.value ** 2 }),
-  });
-});
-
-ordo.step<{ value: number }>({
-  name: "sum",
-  run: async (ctx) => {
-    const [double, square] = await Promise.all([
-      ctx.result<{ value: number }>("double"),
-      ctx.result<{ value: number }>("square"),
-    ]);
-    await ctx.complete({ value: double.value + square.value });
-  },
+ordo.plan(async ({ input, step, parallel }) => {
+  const first = await step(double, input);
+  if (first.value > 10) {
+    await parallel([first.value, first.value + 1].map(value =>
+      step(double, { value })
+    ));
+  }
 });
 ```
 
-This replaces the first `double` definition. See the [example](example/src/index.ts) for validation and evaluation on all three steps.
+Register one callback per workflow. On each advance the planner calls it from the beginning, returning stored results for completed calls and yielding at pending steps. `parallel()` returns results in argument order and accepts an empty array.
+
+Read current data via `env` in the callback. Put side effects in step handlers and let exceptions from step calls propagate. Step names beginning with `@plan:` are reserved. Within a Goal, a handler name and JSON input identify one step. Include a candidate ID in the input to distinguish different targets. Per-step arguments appear in step names in the history API.
 
 ## Configure improvements and expiration
 
